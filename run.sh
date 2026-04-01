@@ -3,13 +3,14 @@
 # TCP fallback is intentionally disabled — if RDMA is unavailable the run aborts.
 #
 # Usage:
+#   bash run.sh
 #   bash run.sh <node0_ip> <node1_ip>
 #
-# Required env (set before calling):
-#   NCCL_IB_HCA       mlx5 device to use, e.g. mlx5_0  or  mlx5_0:1
-#                     check available devices: ibv_devinfo | grep hca_id
+# Default setup in this script:
+#   NCCL_IB_HCA      mlx5_0
+#   BENCH_GPU_ID     0
 #
-# Optional env:
+# Optional env overrides:
 #   BENCH_GPU_ID      GPU device index on each node     (default 0)
 #   BENCH_BUF_GB      D2H/H2D buffer size in GB         (default 4)
 #   BENCH_RS_BUF_GB   ReduceScatter buffer in GB        (default 2)
@@ -20,8 +21,11 @@
 
 set -euo pipefail
 
-NODE0=${1:?"Usage: $0 <node0_ip> <node1_ip>"}
-NODE1=${2:?"Usage: $0 <node0_ip> <node1_ip>"}
+DEFAULT_NODE0=
+DEFAULT_NODE1=
+
+NODE0=${1:-$DEFAULT_NODE0}
+NODE1=${2:-$DEFAULT_NODE1}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY="${SCRIPT_DIR}/bench"
@@ -32,12 +36,7 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 # ── RDMA is mandatory ─────────────────────────────────────────────────────────
-if [[ -z "${NCCL_IB_HCA:-}" ]]; then
-    echo "ERROR: NCCL_IB_HCA is not set."
-    echo "       Run  ibv_devinfo | grep hca_id  to list available mlx5 devices."
-    echo "       Then:  NCCL_IB_HCA=mlx5_0 bash run.sh ..."
-    exit 1
-fi
+export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0}
 
 # Verify the specified HCA exists on this machine
 if ! ibv_devinfo -d "${NCCL_IB_HCA%%:*}" &>/dev/null; then
@@ -69,6 +68,7 @@ echo "  HCA       : ${NCCL_IB_HCA}"
 echo "  GID index : ${NCCL_IB_GID_INDEX}"
 echo "  GPU       : device ${BENCH_GPU_ID}"
 echo "  Nodes     : ${NODE0}  ${NODE1}"
+echo "  Override  : bash run.sh <node0_ip> <node1_ip>"
 echo "========================================================"
 echo ""
 
