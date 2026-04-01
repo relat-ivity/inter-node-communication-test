@@ -54,15 +54,17 @@ export BENCH_ITERS=${BENCH_ITERS:-20}
 export BENCH_WARMUP=${BENCH_WARMUP:-5}
 
 # Force RDMA — no TCP fallback
+export NCCL_NET=IB
 export NCCL_IB_DISABLE=0
-export NCCL_NET_GDR_LEVEL=5        # GPUDirect RDMA: NIC reads GPU memory directly
+export NCCL_NET_GDR_LEVEL=SYS      # GPUDirect RDMA across the full system topology
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_HCA                 # already set by caller
 export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}   # 3 = RoCEv2
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET}
 
 echo "========================================================"
-echo "  Transport : RDMA — mlx5 / RoCEv2 + GPUDirect"
+echo "  Transport : NCCL NET=IB (RDMA only)"
 echo "  HCA       : ${NCCL_IB_HCA}"
 echo "  GID index : ${NCCL_IB_GID_INDEX}"
 echo "  GPU       : device ${BENCH_GPU_ID}"
@@ -78,11 +80,13 @@ mpirun \
     -x BENCH_RS_BUF_GB \
     -x BENCH_ITERS \
     -x BENCH_WARMUP \
+    -x NCCL_NET \
     -x NCCL_IB_DISABLE \
     -x NCCL_IB_HCA \
     -x NCCL_IB_GID_INDEX \
     -x NCCL_NET_GDR_LEVEL \
     -x NCCL_P2P_DISABLE \
     -x NCCL_DEBUG \
+    -x NCCL_DEBUG_SUBSYS \
     --map-by node \
     "$BINARY"

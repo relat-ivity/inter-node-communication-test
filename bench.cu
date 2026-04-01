@@ -132,6 +132,42 @@ static void print_stats(const Stats &s) {
            s.label.c_str(), s.bw_gb_s, s.avg_ms, s.p99_ms, s.std_ms);
 }
 
+static Stats summarize_stats_across_ranks(const Stats &local, int rank, int nranks)
+{
+    double local_vals[4] = {
+        local.bw_gb_s,
+        local.avg_ms,
+        local.p99_ms,
+        local.std_ms,
+    };
+
+    std::vector<double> gathered;
+    if (rank == 0) gathered.resize(nranks * 4);
+
+    MPI_CHECK(MPI_Gather(local_vals, 4, MPI_DOUBLE,
+                         rank == 0 ? gathered.data() : nullptr,
+                         4, MPI_DOUBLE, 0, MPI_COMM_WORLD));
+
+    if (rank != 0) return local;
+
+    double min_bw  = gathered[0];
+    double max_avg = gathered[1];
+    double max_p99 = gathered[2];
+    double max_std = gathered[3];
+
+    for (int r = 0; r < nranks; r++) {
+        const double *vals = &gathered[r * 4];
+        printf("    rank %-2d %-28s  BW=%7.2f GB/s  avg=%8.3f ms  p99=%8.3f ms  std=%7.3f ms\n",
+               r, local.label.c_str(), vals[0], vals[1], vals[2], vals[3]);
+        min_bw  = std::min(min_bw,  vals[0]);
+        max_avg = std::max(max_avg, vals[1]);
+        max_p99 = std::max(max_p99, vals[2]);
+        max_std = std::max(max_std, vals[3]);
+    }
+
+    return {local.label + " [worst rank]", min_bw, max_avg, max_p99, max_std};
+}
+
 static void print_delta(const char *name,
                         const Stats &solo, const Stats &conc)
 {
@@ -434,8 +470,9 @@ int main(int argc, char **argv)
         printf("Phase 1: Solo D2H\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_d2h = bench_d2h(d_mem_buf, h_buf, mem_bytes,
-                                stream_mem, iters, warmup);
+    Stats solo_d2h_local = bench_d2h(d_mem_buf, h_buf, mem_bytes,
+                                     stream_mem, iters, warmup);
+    Stats solo_d2h = summarize_stats_across_ranks(solo_d2h_local, rank, nranks);
     if (rank == 0) { print_stats(solo_d2h); printf("\n"); }
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
@@ -444,8 +481,9 @@ int main(int argc, char **argv)
         printf("Phase 2: Solo H2D\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_h2d = bench_h2d(d_mem_buf, h_buf, mem_bytes,
-                                stream_mem, iters, warmup);
+    Stats solo_h2d_local = bench_h2d(d_mem_buf, h_buf, mem_bytes,
+                                     stream_mem, iters, warmup);
+    Stats solo_h2d = summarize_stats_across_ranks(solo_h2d_local, rank, nranks);
     if (rank == 0) { print_stats(solo_h2d); printf("\n"); }
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
@@ -454,8 +492,9 @@ int main(int argc, char **argv)
         printf("Phase 3: Solo ReduceScatter (cross-node NCCL)\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_rs = bench_rs(d_rs_send, d_rs_recv, rs_bytes, nranks,
-                              comm, stream_rs, iters, warmup);
+    Stats solo_rs_local = bench_rs(d_rs_send, d_rs_recv, rs_bytes, nranks,
+                                   comm, stream_rs, iters, warmup);
+    Stats solo_rs = summarize_stats_across_ranks(solo_rs_local, rank, nranks);
     if (rank == 0) { print_stats(solo_rs); printf("\n"); }
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
@@ -464,10 +503,14 @@ int main(int argc, char **argv)
         printf("Phase 4: Concurrent D2H + ReduceScatter\n");
         printf("------------------------------------------------------------\n");
     }
-    ConcurrentResult cr_d2h = bench_concurrent_d2h_rs(
+    ConcurrentResult cr_d2h_local = bench_concurrent_d2h_rs(
         d_mem_buf, h_buf, mem_bytes,
         d_rs_send, d_rs_recv, rs_bytes, nranks,
         comm, stream_mem, stream_rs, iters, warmup, "D2H");
+    ConcurrentResult cr_d2h {
+        summarize_stats_across_ranks(cr_d2h_local.mem_stats, rank, nranks),
+        summarize_stats_across_ranks(cr_d2h_local.rs_stats,  rank, nranks),
+    };
     if (rank == 0) {
         print_stats(cr_d2h.mem_stats);
         print_stats(cr_d2h.rs_stats);
@@ -480,10 +523,14 @@ int main(int argc, char **argv)
         printf("Phase 5: Concurrent H2D + ReduceScatter\n");
         printf("------------------------------------------------------------\n");
     }
-    ConcurrentResult cr_h2d = bench_concurrent_h2d_rs(
+    ConcurrentResult cr_h2d_local = bench_concurrent_h2d_rs(
         d_mem_buf, h_buf, mem_bytes,
         d_rs_send, d_rs_recv, rs_bytes, nranks,
         comm, stream_mem, stream_rs, iters, warmup);
+    ConcurrentResult cr_h2d {
+        summarize_stats_across_ranks(cr_h2d_local.mem_stats, rank, nranks),
+        summarize_stats_across_ranks(cr_h2d_local.rs_stats,  rank, nranks),
+    };
     if (rank == 0) {
         print_stats(cr_h2d.mem_stats);
         print_stats(cr_h2d.rs_stats);
@@ -494,7 +541,7 @@ int main(int argc, char **argv)
     // ── Summary ───────────────────────────────────────────────────────────────
     if (rank == 0) {
         printf("============================================================\n");
-        printf("  Interference Summary  (>5%% BW drop or latency increase)\n");
+        printf("  Interference Summary (worst rank, >5%% BW drop or latency increase)\n");
         printf("============================================================\n");
         printf("  [D2H + RS concurrently vs solo]\n");
         print_delta("  D2H",          solo_d2h, cr_d2h.mem_stats);
