@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -230,19 +233,6 @@ static void control_barrier()
     }
 }
 
-static std::vector<double> control_gather_doubles(const double *local, size_t count)
-{
-    std::vector<double> gathered;
-    if (g_control.rank == 0) {
-        gathered.resize(static_cast<size_t>(g_control.nranks) * count);
-        memcpy(gathered.data(), local, count * sizeof(double));
-        recv_all(g_control.sock_fd, gathered.data() + count, count * sizeof(double));
-    } else {
-        send_all(g_control.sock_fd, local, count * sizeof(double));
-    }
-    return gathered;
-}
-
 struct CudaTimer {
     cudaEvent_t start, stop;
     CudaTimer() {
@@ -271,9 +261,15 @@ struct Stats {
     double std_ms;
 };
 
+struct Measurement {
+    std::vector<float> lats_ms;
+    double total_ms = 0.0;
+};
+
 static Stats compute_stats(const std::string &label,
                            std::vector<float> &lats_ms,
-                           size_t bytes_per_iter)
+                           size_t bytes_per_iter,
+                           double total_ms)
 {
     std::sort(lats_ms.begin(), lats_ms.end());
     double sum = 0;
@@ -288,7 +284,7 @@ static Stats compute_stats(const std::string &label,
     double p99 = lats_ms[p99_idx];
 
     double total_gb = static_cast<double>(bytes_per_iter) * lats_ms.size() / 1e9;
-    double total_s = sum / 1e3;
+    double total_s = total_ms / 1e3;
     double bw = total_gb / total_s;
 
     return {label, bw, avg, p99, std};
@@ -300,36 +296,6 @@ static void print_stats(const Stats &s)
            s.label.c_str(), s.bw_gb_s, s.avg_ms, s.p99_ms, s.std_ms);
 }
 
-static Stats summarize_stats_across_ranks(const Stats &local, int rank, int nranks)
-{
-    double local_vals[4] = {
-        local.bw_gb_s,
-        local.avg_ms,
-        local.p99_ms,
-        local.std_ms,
-    };
-
-    std::vector<double> gathered = control_gather_doubles(local_vals, 4);
-    if (rank != 0) return local;
-
-    double min_bw = gathered[0];
-    double max_avg = gathered[1];
-    double max_p99 = gathered[2];
-    double max_std = gathered[3];
-
-    for (int r = 0; r < nranks; r++) {
-        const double *vals = &gathered[static_cast<size_t>(r) * 4];
-        printf("    rank %-2d %-28s  BW=%7.2f GB/s  avg=%8.3f ms  p99=%8.3f ms  std=%7.3f ms\n",
-               r, local.label.c_str(), vals[0], vals[1], vals[2], vals[3]);
-        min_bw = std::min(min_bw, vals[0]);
-        max_avg = std::max(max_avg, vals[1]);
-        max_p99 = std::max(max_p99, vals[2]);
-        max_std = std::max(max_std, vals[3]);
-    }
-
-    return {local.label + " [worst rank]", min_bw, max_avg, max_p99, max_std};
-}
-
 static void print_delta(const char *name, const Stats &solo, const Stats &conc)
 {
     double bw_delta = (conc.bw_gb_s - solo.bw_gb_s) / solo.bw_gb_s * 100.0;
@@ -339,8 +305,8 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
     printf("  %s\n", bad ? "<-- INTERFERENCE" : "OK");
 }
 
-static Stats bench_d2h(float *d_buf, float *h_buf, size_t n_bytes,
-                       cudaStream_t stream, int iters, int warmup)
+static Measurement measure_d2h(float *d_buf, float *h_buf, size_t n_bytes,
+                               cudaStream_t stream, int iters, int warmup)
 {
     CudaTimer timer;
     for (int i = 0; i < warmup; i++) {
@@ -348,21 +314,23 @@ static Stats bench_d2h(float *d_buf, float *h_buf, size_t n_bytes,
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    std::vector<float> lats;
-    lats.reserve(iters);
+    Measurement result;
+    result.lats_ms.reserve(iters);
+    auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
         timer.begin(stream);
         CUDA_CHECK(cudaMemcpyAsync(h_buf, d_buf, n_bytes,
                                    cudaMemcpyDeviceToHost, stream));
         timer.end(stream);
-        lats.push_back(timer.elapsed_ms());
+        result.lats_ms.push_back(timer.elapsed_ms());
     }
-    control_barrier();
-    return compute_stats("D2H (solo)", lats, n_bytes);
+    auto end = std::chrono::steady_clock::now();
+    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    return result;
 }
 
-static Stats bench_h2d(float *d_buf, float *h_buf, size_t n_bytes,
-                       cudaStream_t stream, int iters, int warmup)
+static Measurement measure_h2d(float *d_buf, float *h_buf, size_t n_bytes,
+                               cudaStream_t stream, int iters, int warmup)
 {
     CudaTimer timer;
     for (int i = 0; i < warmup; i++) {
@@ -370,23 +338,25 @@ static Stats bench_h2d(float *d_buf, float *h_buf, size_t n_bytes,
                                    cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    std::vector<float> lats;
-    lats.reserve(iters);
+    Measurement result;
+    result.lats_ms.reserve(iters);
+    auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
         timer.begin(stream);
         CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, n_bytes,
                                    cudaMemcpyHostToDevice, stream));
         timer.end(stream);
-        lats.push_back(timer.elapsed_ms());
+        result.lats_ms.push_back(timer.elapsed_ms());
     }
-    control_barrier();
-    return compute_stats("H2D (solo)", lats, n_bytes);
+    auto end = std::chrono::steady_clock::now();
+    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    return result;
 }
 
-static Stats bench_rs(float *send_buf, float *recv_buf,
-                      size_t rs_bytes, int nranks,
-                      ncclComm_t comm, cudaStream_t stream,
-                      int iters, int warmup)
+static Measurement measure_rs(float *send_buf, float *recv_buf,
+                              size_t rs_bytes, int nranks,
+                              ncclComm_t comm, cudaStream_t stream,
+                              int iters, int warmup)
 {
     size_t recv_count = rs_bytes / sizeof(float) / nranks;
     CudaTimer timer;
@@ -395,20 +365,20 @@ static Stats bench_rs(float *send_buf, float *recv_buf,
         NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
                                      ncclFloat, ncclSum, comm, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        control_barrier();
     }
-    std::vector<float> lats;
-    lats.reserve(iters);
+    Measurement result;
+    result.lats_ms.reserve(iters);
+    auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
         timer.begin(stream);
         NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
                                      ncclFloat, ncclSum, comm, stream));
         timer.end(stream);
-        float ms = timer.elapsed_ms();
-        control_barrier();
-        lats.push_back(ms);
+        result.lats_ms.push_back(timer.elapsed_ms());
     }
-    return compute_stats("ReduceScatter (solo)", lats, rs_bytes);
+    auto end = std::chrono::steady_clock::now();
+    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    return result;
 }
 
 struct ConcurrentResult {
@@ -421,49 +391,48 @@ static ConcurrentResult bench_concurrent_d2h_rs(
         float *send_buf, float *recv_buf, size_t rs_bytes, int nranks,
         ncclComm_t comm,
         cudaStream_t stream_mem, cudaStream_t stream_rs,
-        int iters, int warmup,
+        int gpu_id, int iters, int warmup,
         const char *mem_label)
 {
-    size_t recv_count = rs_bytes / sizeof(float) / nranks;
-    CudaTimer timer_mem, timer_rs;
+    Measurement mem_measurement;
+    Measurement rs_measurement;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
 
-    auto do_memcpy = [&](cudaStream_t s) {
-        CUDA_CHECK(cudaMemcpyAsync(h_buf, d_buf, mem_bytes,
-                                   cudaMemcpyDeviceToHost, s));
-    };
+    std::thread mem_thread([&]() {
+        CUDA_CHECK(cudaSetDevice(gpu_id));
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        mem_measurement = measure_d2h(
+            d_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+    });
 
-    for (int i = 0; i < warmup; i++) {
-        do_memcpy(stream_mem);
-        NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
-                                     ncclFloat, ncclSum, comm, stream_rs));
-        CUDA_CHECK(cudaStreamSynchronize(stream_mem));
-        CUDA_CHECK(cudaStreamSynchronize(stream_rs));
-        control_barrier();
+    std::thread rs_thread([&]() {
+        CUDA_CHECK(cudaSetDevice(gpu_id));
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        rs_measurement = measure_rs(
+            send_buf, recv_buf, rs_bytes, nranks, comm, stream_rs, iters, warmup);
+    });
+
+    while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
     }
+    control_barrier();
+    start.store(true, std::memory_order_release);
 
-    std::vector<float> lats_mem, lats_rs;
-    lats_mem.reserve(iters);
-    lats_rs.reserve(iters);
-
-    for (int i = 0; i < iters; i++) {
-        timer_mem.begin(stream_mem);
-        do_memcpy(stream_mem);
-        timer_mem.end(stream_mem);
-
-        timer_rs.begin(stream_rs);
-        NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
-                                     ncclFloat, ncclSum, comm, stream_rs));
-        timer_rs.end(stream_rs);
-
-        lats_mem.push_back(timer_mem.elapsed_ms());
-        lats_rs.push_back(timer_rs.elapsed_ms());
-        control_barrier();
-    }
+    mem_thread.join();
+    rs_thread.join();
 
     std::string mem_lbl = std::string(mem_label) + " (concurrent)";
     return {
-        compute_stats(mem_lbl, lats_mem, mem_bytes),
-        compute_stats("ReduceScatter (concurrent)", lats_rs, rs_bytes),
+        compute_stats(mem_lbl, mem_measurement.lats_ms, mem_bytes, mem_measurement.total_ms),
+        compute_stats("ReduceScatter (concurrent)", rs_measurement.lats_ms,
+                      rs_bytes, rs_measurement.total_ms),
     };
 }
 
@@ -472,44 +441,47 @@ static ConcurrentResult bench_concurrent_h2d_rs(
         float *send_buf, float *recv_buf, size_t rs_bytes, int nranks,
         ncclComm_t comm,
         cudaStream_t stream_mem, cudaStream_t stream_rs,
-        int iters, int warmup)
+        int gpu_id, int iters, int warmup)
 {
-    size_t recv_count = rs_bytes / sizeof(float) / nranks;
-    CudaTimer timer_mem, timer_rs;
+    Measurement mem_measurement;
+    Measurement rs_measurement;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
 
-    for (int i = 0; i < warmup; i++) {
-        CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, mem_bytes,
-                                   cudaMemcpyHostToDevice, stream_mem));
-        NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
-                                     ncclFloat, ncclSum, comm, stream_rs));
-        CUDA_CHECK(cudaStreamSynchronize(stream_mem));
-        CUDA_CHECK(cudaStreamSynchronize(stream_rs));
-        control_barrier();
+    std::thread mem_thread([&]() {
+        CUDA_CHECK(cudaSetDevice(gpu_id));
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        mem_measurement = measure_h2d(
+            d_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+    });
+
+    std::thread rs_thread([&]() {
+        CUDA_CHECK(cudaSetDevice(gpu_id));
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        rs_measurement = measure_rs(
+            send_buf, recv_buf, rs_bytes, nranks, comm, stream_rs, iters, warmup);
+    });
+
+    while (ready.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
     }
+    control_barrier();
+    start.store(true, std::memory_order_release);
 
-    std::vector<float> lats_mem, lats_rs;
-    lats_mem.reserve(iters);
-    lats_rs.reserve(iters);
-
-    for (int i = 0; i < iters; i++) {
-        timer_mem.begin(stream_mem);
-        CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, mem_bytes,
-                                   cudaMemcpyHostToDevice, stream_mem));
-        timer_mem.end(stream_mem);
-
-        timer_rs.begin(stream_rs);
-        NCCL_CHECK(ncclReduceScatter(send_buf, recv_buf, recv_count,
-                                     ncclFloat, ncclSum, comm, stream_rs));
-        timer_rs.end(stream_rs);
-
-        lats_mem.push_back(timer_mem.elapsed_ms());
-        lats_rs.push_back(timer_rs.elapsed_ms());
-        control_barrier();
-    }
+    mem_thread.join();
+    rs_thread.join();
 
     return {
-        compute_stats("H2D (concurrent)", lats_mem, mem_bytes),
-        compute_stats("ReduceScatter (concurrent)", lats_rs, rs_bytes),
+        compute_stats("H2D (concurrent)", mem_measurement.lats_ms,
+                      mem_bytes, mem_measurement.total_ms),
+        compute_stats("ReduceScatter (concurrent)", rs_measurement.lats_ms,
+                      rs_bytes, rs_measurement.total_ms),
     };
 }
 
@@ -610,8 +582,11 @@ int main(int argc, char **argv)
         printf("Phase 1: Solo D2H\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_d2h_local = bench_d2h(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
-    Stats solo_d2h = summarize_stats_across_ranks(solo_d2h_local, rank, nranks);
+    control_barrier();
+    Measurement solo_d2h_measurement =
+        measure_d2h(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+    Stats solo_d2h = compute_stats(
+        "D2H (solo)", solo_d2h_measurement.lats_ms, mem_bytes, solo_d2h_measurement.total_ms);
     if (rank == 0) { print_stats(solo_d2h); printf("\n"); }
     control_barrier();
 
@@ -619,8 +594,11 @@ int main(int argc, char **argv)
         printf("Phase 2: Solo H2D\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_h2d_local = bench_h2d(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
-    Stats solo_h2d = summarize_stats_across_ranks(solo_h2d_local, rank, nranks);
+    control_barrier();
+    Measurement solo_h2d_measurement =
+        measure_h2d(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+    Stats solo_h2d = compute_stats(
+        "H2D (solo)", solo_h2d_measurement.lats_ms, mem_bytes, solo_h2d_measurement.total_ms);
     if (rank == 0) { print_stats(solo_h2d); printf("\n"); }
     control_barrier();
 
@@ -628,9 +606,11 @@ int main(int argc, char **argv)
         printf("Phase 3: Solo ReduceScatter (cross-node NCCL)\n");
         printf("------------------------------------------------------------\n");
     }
-    Stats solo_rs_local = bench_rs(d_rs_send, d_rs_recv, rs_bytes, nranks,
-                                   comm, stream_rs, iters, warmup);
-    Stats solo_rs = summarize_stats_across_ranks(solo_rs_local, rank, nranks);
+    control_barrier();
+    Measurement solo_rs_measurement =
+        measure_rs(d_rs_send, d_rs_recv, rs_bytes, nranks, comm, stream_rs, iters, warmup);
+    Stats solo_rs = compute_stats(
+        "ReduceScatter (solo)", solo_rs_measurement.lats_ms, rs_bytes, solo_rs_measurement.total_ms);
     if (rank == 0) { print_stats(solo_rs); printf("\n"); }
     control_barrier();
 
@@ -638,13 +618,10 @@ int main(int argc, char **argv)
         printf("Phase 4: Concurrent D2H + ReduceScatter\n");
         printf("------------------------------------------------------------\n");
     }
-    ConcurrentResult cr_d2h_local = bench_concurrent_d2h_rs(
+    control_barrier();
+    ConcurrentResult cr_d2h = bench_concurrent_d2h_rs(
         d_mem_buf, h_buf, mem_bytes, d_rs_send, d_rs_recv, rs_bytes, nranks,
-        comm, stream_mem, stream_rs, iters, warmup, "D2H");
-    ConcurrentResult cr_d2h{
-        summarize_stats_across_ranks(cr_d2h_local.mem_stats, rank, nranks),
-        summarize_stats_across_ranks(cr_d2h_local.rs_stats, rank, nranks),
-    };
+        comm, stream_mem, stream_rs, gpu_id, iters, warmup, "D2H");
     if (rank == 0) {
         print_stats(cr_d2h.mem_stats);
         print_stats(cr_d2h.rs_stats);
@@ -656,13 +633,10 @@ int main(int argc, char **argv)
         printf("Phase 5: Concurrent H2D + ReduceScatter\n");
         printf("------------------------------------------------------------\n");
     }
-    ConcurrentResult cr_h2d_local = bench_concurrent_h2d_rs(
+    control_barrier();
+    ConcurrentResult cr_h2d = bench_concurrent_h2d_rs(
         d_mem_buf, h_buf, mem_bytes, d_rs_send, d_rs_recv, rs_bytes, nranks,
-        comm, stream_mem, stream_rs, iters, warmup);
-    ConcurrentResult cr_h2d{
-        summarize_stats_across_ranks(cr_h2d_local.mem_stats, rank, nranks),
-        summarize_stats_across_ranks(cr_h2d_local.rs_stats, rank, nranks),
-    };
+        comm, stream_mem, stream_rs, gpu_id, iters, warmup);
     if (rank == 0) {
         print_stats(cr_h2d.mem_stats);
         print_stats(cr_h2d.rs_stats);
@@ -672,7 +646,7 @@ int main(int argc, char **argv)
 
     if (rank == 0) {
         printf("============================================================\n");
-        printf("  Interference Summary (worst rank, >5%% BW drop or latency increase)\n");
+        printf("  Interference Summary (rank 0 local view, >5%% BW drop or latency increase)\n");
         printf("============================================================\n");
         printf("  [D2H + RS concurrently vs solo]\n");
         print_delta("  D2H", solo_d2h, cr_d2h.mem_stats);
