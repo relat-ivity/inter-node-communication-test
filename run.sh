@@ -6,9 +6,13 @@
 #   On node1: bash run.sh rank1
 #
 # Edit defaults here first.
+# To run the GDR benchmark:
+#   BENCH_BIN=gdr_bench bash run.sh rank0
+#   BENCH_BIN=gdr_bench bash run.sh rank1
 
 DEFAULT_NODE0=
 DEFAULT_NODE1=
+DEFAULT_BENCH_BIN=cuda_bench
 DEFAULT_NCCL_IB_HCA=mlx5_4
 DEFAULT_BENCH_GPU_ID=4
 DEFAULT_BENCH_BUF_GB=4
@@ -20,6 +24,7 @@ DEFAULT_NCCL_IB_GID_INDEX=3
 DEFAULT_NCCL_DEBUG=WARN
 DEFAULT_NCCL_DEBUG_SUBSYS=INIT,NET
 DEFAULT_NCCL_NET_GDR_LEVEL=SYS
+DEFAULT_BENCH_GDR_USE_ODP=0
 
 set -euo pipefail
 
@@ -30,7 +35,17 @@ if [[ -z "$ROLE" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="${SCRIPT_DIR}/bench"
+BENCH_BIN=${BENCH_BIN:-$DEFAULT_BENCH_BIN}
+case "$BENCH_BIN" in
+    cuda_bench|gdr_bench)
+        ;;
+    *)
+        echo "ERROR: BENCH_BIN must be cuda_bench or gdr_bench."
+        exit 1
+        ;;
+esac
+
+BINARY="${SCRIPT_DIR}/${BENCH_BIN}"
 
 NODE0=${NODE0:-$DEFAULT_NODE0}
 NODE1=${NODE1:-$DEFAULT_NODE1}
@@ -44,6 +59,10 @@ export BENCH_WARMUP=${BENCH_WARMUP:-$DEFAULT_BENCH_WARMUP}
 export BENCH_WORLD_SIZE=2
 export BENCH_MASTER_ADDR=${BENCH_MASTER_ADDR:-$NODE0}
 export BENCH_MASTER_PORT=${BENCH_MASTER_PORT:-$DEFAULT_BENCH_MASTER_PORT}
+DEFAULT_GDR_NIC_FROM_HCA=${NCCL_IB_HCA%%,*}
+DEFAULT_GDR_NIC_FROM_HCA=${DEFAULT_GDR_NIC_FROM_HCA%%:*}
+export BENCH_GDR_NIC=${BENCH_GDR_NIC:-$DEFAULT_GDR_NIC_FROM_HCA}
+export BENCH_GDR_USE_ODP=${BENCH_GDR_USE_ODP:-$DEFAULT_BENCH_GDR_USE_ODP}
 
 # Force NCCL to use RDMA/IB only.
 export NCCL_NET=IB
@@ -70,8 +89,8 @@ case "$ROLE" in
 esac
 
 if [[ ! -x "$BINARY" ]]; then
-    echo "[run.sh] Binary not found. Building first..."
-    make -C "$SCRIPT_DIR"
+    echo "[run.sh] ${BENCH_BIN} not found. Building first..."
+    make -C "$SCRIPT_DIR" "$BENCH_BIN"
 fi
 
 if [[ -z "$NODE0" || -z "$NODE1" ]]; then
@@ -85,12 +104,23 @@ if ! ibv_devinfo -d "${NCCL_IB_HCA%%:*}" &>/dev/null; then
     exit 1
 fi
 
+if [[ "$BENCH_BIN" == "gdr_bench" ]] && ! ibv_devinfo -d "${BENCH_GDR_NIC}" &>/dev/null; then
+    echo "ERROR: GDR NIC '${BENCH_GDR_NIC}' not found on this node."
+    echo "       Set BENCH_GDR_NIC explicitly or check ibv_devinfo output."
+    exit 1
+fi
+
 echo "========================================================"
 echo "  Role      : ${ROLE}"
+echo "  Binary    : ${BENCH_BIN}"
 echo "  Local IP  : ${LOCAL_NODE_IP}"
 echo "  Master    : ${BENCH_MASTER_ADDR}:${BENCH_MASTER_PORT}"
 echo "  Transport : NCCL NET=IB (RDMA only)"
 echo "  HCA       : ${NCCL_IB_HCA}"
+if [[ "$BENCH_BIN" == "gdr_bench" ]]; then
+    echo "  GDR NIC   : ${BENCH_GDR_NIC}"
+    echo "  GDR ODP   : ${BENCH_GDR_USE_ODP}"
+fi
 echo "  GID index : ${NCCL_IB_GID_INDEX}"
 echo "  GPU       : device ${BENCH_GPU_ID}"
 echo "========================================================"
