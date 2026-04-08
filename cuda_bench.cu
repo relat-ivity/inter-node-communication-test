@@ -297,7 +297,7 @@ static Stats compute_stats(const std::string &label,
 
 static void print_stats(const Stats &s)
 {
-    printf("  %-38s  BW=%7.2f GB/s  avg=%8.3f ms  p99=%8.3f ms  std=%7.3f ms\n",
+    printf("  %-28s | BW=%8.2f GB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
            s.label.c_str(), s.bw_gb_s, s.avg_ms, s.p99_ms, s.std_ms);
 }
 
@@ -305,9 +305,9 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
 {
     double bw_delta = (conc.bw_gb_s - solo.bw_gb_s) / solo.bw_gb_s * 100.0;
     double lat_delta = (conc.avg_ms - solo.avg_ms) / solo.avg_ms * 100.0;
-    printf("  %-10s  BW: %+6.1f%%   avg-lat: %+6.1f%%", name, bw_delta, lat_delta);
+    printf("  %-16s | BW=%+6.1f%% | avg-lat=%+6.1f%%", name, bw_delta, lat_delta);
     bool bad = (bw_delta < -5.0) || (lat_delta > 5.0);
-    printf("  %s\n", bad ? "<-- INTERFERENCE" : "OK");
+    printf(" | %s\n", bad ? "<-- INTERFERENCE" : "OK");
 }
 
 static Measurement measure_d2h(float *d_buf, float *h_buf, size_t n_bytes,
@@ -690,12 +690,12 @@ int main(int argc, char **argv)
         printf("  Interference Summary (rank 0 local view, >5%% BW drop or latency increase)\n");
         printf("============================================================\n");
         printf("  [D2H + ncclSend concurrently vs solo]\n");
-        print_delta("  D2H", solo_d2h, cr_d2h.mem_stats);
-        print_delta("  Send (vs D2H)", solo_rs, cr_d2h.rs_stats);
+        print_delta("D2H", solo_d2h, cr_d2h.mem_stats);
+        print_delta("Send (vs D2H)", solo_rs, cr_d2h.rs_stats);
         printf("\n");
         printf("  [H2D + ncclSend concurrently vs solo]\n");
-        print_delta("  H2D", solo_h2d, cr_h2d.mem_stats);
-        print_delta("  Send (vs H2D)", solo_rs, cr_h2d.rs_stats);
+        print_delta("H2D", solo_h2d, cr_h2d.mem_stats);
+        print_delta("Send (vs H2D)", solo_rs, cr_h2d.rs_stats);
         printf("============================================================\n\n");
     }
 

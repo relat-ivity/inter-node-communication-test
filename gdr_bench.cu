@@ -340,7 +340,7 @@ static Stats compute_stats(const std::string &label,
 
 static void print_stats(const Stats &s)
 {
-    printf("  %-38s  BW=%7.2f GB/s  avg=%8.3f ms  p99=%8.3f ms  std=%7.3f ms\n",
+    printf("  %-28s | BW=%8.2f GB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
            s.label.c_str(), s.bw_gb_s, s.avg_ms, s.p99_ms, s.std_ms);
 }
 
@@ -354,7 +354,7 @@ static const char *gdr_path_name(const GDRStats &s)
 
 static void print_gdr_transport_stats(const char *label, const GDRStats &s)
 {
-    printf("    %-36s  path=%-18s ops=%6llu rdma=%6llu fallback=%6llu avg-op=%8.3f us\n",
+    printf("    %-28s | path=%-17s | ops=%6llu | rdma=%6llu | fallback=%6llu | avg-op=%9.3f us\n",
            label, gdr_path_name(s),
            static_cast<unsigned long long>(s.total_ops),
            static_cast<unsigned long long>(s.rdma_ops),
@@ -366,9 +366,9 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
 {
     double bw_delta = (conc.bw_gb_s - solo.bw_gb_s) / solo.bw_gb_s * 100.0;
     double lat_delta = (conc.avg_ms - solo.avg_ms) / solo.avg_ms * 100.0;
-    printf("  %-16s  BW: %+6.1f%%   avg-lat: %+6.1f%%", name, bw_delta, lat_delta);
+    printf("  %-16s | BW=%+6.1f%% | avg-lat=%+6.1f%%", name, bw_delta, lat_delta);
     bool bad = (bw_delta < -5.0) || (lat_delta > 5.0);
-    printf("  %s\n", bad ? "<-- INTERFERENCE" : "OK");
+    printf(" | %s\n", bad ? "<-- INTERFERENCE" : "OK");
 }
 
 static Measurement measure_p2p(float *send_buf, float *recv_buf,

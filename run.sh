@@ -35,6 +35,7 @@ if [[ -z "$ROLE" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="${SCRIPT_DIR}/build"
 BENCH_BIN=${BENCH_BIN:-$DEFAULT_BENCH_BIN}
 case "$BENCH_BIN" in
     cuda_bench|gdr_bench)
@@ -45,7 +46,7 @@ case "$BENCH_BIN" in
         ;;
 esac
 
-BINARY="${SCRIPT_DIR}/${BENCH_BIN}"
+BINARY="${BUILD_DIR}/${BENCH_BIN}"
 
 NODE0=${NODE0:-$DEFAULT_NODE0}
 NODE1=${NODE1:-$DEFAULT_NODE1}
