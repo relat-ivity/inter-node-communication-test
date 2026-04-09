@@ -130,14 +130,19 @@ static double env_double_strict(const char *name, double def)
     return parsed;
 }
 
-static int env_ib_sl(const char *name, int def)
+static int env_traffic_class(const char *name, int def)
 {
-    int sl = env_int_strict(name, def);
-    if (sl < 0 || sl > 15) {
+    int tc = env_int_strict(name, def);
+    if (tc < 0 || tc > 255) {
         fatalf("CONFIG", __FILE__, __LINE__,
-               "%s=%d out of range (expected 0..15)", name, sl);
+               "%s=%d out of range (expected 0..255)", name, tc);
     }
-    return sl;
+    return tc;
+}
+
+static int traffic_class_to_dscp(int tc)
+{
+    return (tc >> 2) & 0x3f;
 }
 
 static bool env_bool(const char *name, bool def)
@@ -720,21 +725,21 @@ int main(int argc, char **argv)
     int gpu_id = env_int("BENCH_GPU_ID", 0);
     bool gdr_use_odp = env_bool("BENCH_GDR_USE_ODP", false);
 #if GDR_BENCH_ENABLE_QOS
-    int gdr_ib_sl = env_ib_sl("BENCH_GDR_IB_SL", 1);
-    int nccl_ib_sl = env_ib_sl("NCCL_IB_SL", 0);
+    int gdr_ib_tc = env_traffic_class("BENCH_GDR_IB_TC", 0);
+    int nccl_ib_tc = env_traffic_class("NCCL_IB_TC", 104);
     double qos_min_nccl_ratio = env_double_strict("BENCH_QOS_MIN_NCCL_RATIO", 0.99);
     if (qos_min_nccl_ratio <= 0.0 || qos_min_nccl_ratio > 1.0) {
         fatalf("CONFIG", __FILE__, __LINE__,
                "BENCH_QOS_MIN_NCCL_RATIO=%.6f out of range (expected 0 < ratio <= 1)",
                qos_min_nccl_ratio);
     }
-    if (gdr_ib_sl == nccl_ib_sl) {
+    if (gdr_ib_tc == nccl_ib_tc) {
         fatalf("CONFIG", __FILE__, __LINE__,
-               "BENCH_GDR_IB_SL=%d must differ from NCCL_IB_SL=%d for SL/VL QoS validation",
-               gdr_ib_sl, nccl_ib_sl);
+               "BENCH_GDR_IB_TC=%d must differ from NCCL_IB_TC=%d for RoCE QoS validation",
+               gdr_ib_tc, nccl_ib_tc);
     }
 #else
-    int gdr_ib_sl = 0;
+    int gdr_ib_tc = 0;
 #endif
 
     size_t mem_bytes = static_cast<size_t>(buf_gb * 1e9);
@@ -785,12 +790,18 @@ int main(int argc, char **argv)
 
         try {
             gdr_channel = GDRCopyLib::open(
-                gpu_id, gdr_nic_name, gdr_use_odp, static_cast<uint8_t>(gdr_ib_sl));
+                gpu_id, gdr_nic_name, gdr_use_odp, static_cast<uint8_t>(gdr_ib_tc));
         } catch (const std::exception &ex) {
             fatalf("GDR", __FILE__, __LINE__,
                    "failed to open GDR channel on NIC %s: %s",
                    gdr_nic_name.c_str(), ex.what());
         }
+#if GDR_BENCH_ENABLE_QOS
+        if (!gdr_channel->is_roce()) {
+            fatalf("CONFIG", __FILE__, __LINE__,
+                   "gdr_qos_bench requires a RoCE/Ethernet link layer because it validates NCCL_IB_TC and GDR traffic_class");
+        }
+#endif
     }
 
     float *d_p2p_send = nullptr;
@@ -804,7 +815,7 @@ int main(int argc, char **argv)
         printf("\n");
         printf("============================================================\n");
 #if GDR_BENCH_ENABLE_QOS
-        printf("  Cross-node GDR QoS H2D/D2H vs ncclSend/ncclRecv Benchmark\n");
+        printf("  Cross-node GDR QoS H2D/D2H vs ncclSend/ncclRecv RoCE Benchmark\n");
 #else
         printf("  Cross-node GDR H2D/D2H vs ncclSend/ncclRecv Benchmark\n");
 #endif
@@ -814,8 +825,11 @@ int main(int argc, char **argv)
         printf("  GDR NIC      : %s  (ODP=%s)\n",
                gdr_nic_name.c_str(), gdr_use_odp ? "on" : "off");
 #if GDR_BENCH_ENABLE_QOS
-        printf("  NCCL SL      : %d\n", nccl_ib_sl);
-        printf("  GDR SL       : %u\n", static_cast<unsigned>(gdr_channel->ib_sl()));
+        printf("  NCCL TC      : %d  (DSCP=%d)\n",
+               nccl_ib_tc, traffic_class_to_dscp(nccl_ib_tc));
+        printf("  GDR TC       : %u  (DSCP=%d)\n",
+               static_cast<unsigned>(gdr_channel->traffic_class()),
+               traffic_class_to_dscp(static_cast<int>(gdr_channel->traffic_class())));
         printf("  NCCL target  : %.2f%% of solo BW\n", qos_min_nccl_ratio * 100.0);
 #endif
         printf("  Ranks        : %d  (1 GPU per node)\n", nranks);

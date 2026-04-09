@@ -18,8 +18,8 @@ DEFAULT_NCCL_DEBUG=WARN
 DEFAULT_NCCL_DEBUG_SUBSYS=INIT,NET
 DEFAULT_NCCL_NET_GDR_LEVEL=SYS
 DEFAULT_BENCH_GDR_USE_ODP=0
-DEFAULT_NCCL_IB_SL=0
-DEFAULT_BENCH_GDR_IB_SL=1
+DEFAULT_NCCL_IB_TC=104
+DEFAULT_BENCH_GDR_IB_TC=0
 DEFAULT_BENCH_QOS_MIN_NCCL_RATIO=0.99
 
 set -euo pipefail
@@ -50,7 +50,7 @@ DEFAULT_GDR_NIC_FROM_HCA=${NCCL_IB_HCA%%,*}
 DEFAULT_GDR_NIC_FROM_HCA=${DEFAULT_GDR_NIC_FROM_HCA%%:*}
 export BENCH_GDR_NIC=${BENCH_GDR_NIC:-$DEFAULT_GDR_NIC_FROM_HCA}
 export BENCH_GDR_USE_ODP=${BENCH_GDR_USE_ODP:-$DEFAULT_BENCH_GDR_USE_ODP}
-export BENCH_GDR_IB_SL=${BENCH_GDR_IB_SL:-$DEFAULT_BENCH_GDR_IB_SL}
+export BENCH_GDR_IB_TC=${BENCH_GDR_IB_TC:-$DEFAULT_BENCH_GDR_IB_TC}
 export BENCH_QOS_MIN_NCCL_RATIO=${BENCH_QOS_MIN_NCCL_RATIO:-$DEFAULT_BENCH_QOS_MIN_NCCL_RATIO}
 
 # Force NCCL to use RDMA/IB only.
@@ -58,7 +58,7 @@ export NCCL_NET=IB
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-$DEFAULT_NCCL_NET_GDR_LEVEL}
 export NCCL_P2P_DISABLE=0
-export NCCL_IB_SL=${NCCL_IB_SL:-$DEFAULT_NCCL_IB_SL}
+export NCCL_IB_TC=${NCCL_IB_TC:-$DEFAULT_NCCL_IB_TC}
 if [[ -n "${NCCL_IB_GID_INDEX:-}" ]]; then
     export NCCL_IB_GID_INDEX
 else
@@ -104,8 +104,8 @@ if ! ibv_devinfo -d "${BENCH_GDR_NIC}" &>/dev/null; then
     exit 1
 fi
 
-if [[ "${NCCL_IB_SL}" == "${BENCH_GDR_IB_SL}" ]]; then
-    echo "ERROR: NCCL_IB_SL and BENCH_GDR_IB_SL must differ for SL/VL QoS validation."
+if [[ "${NCCL_IB_TC}" == "${BENCH_GDR_IB_TC}" ]]; then
+    echo "ERROR: NCCL_IB_TC and BENCH_GDR_IB_TC must differ for RoCE QoS validation."
     exit 1
 fi
 
@@ -114,12 +114,12 @@ echo "  Role          : ${ROLE}"
 echo "  Binary        : gdr_qos_bench"
 echo "  Local IP      : ${LOCAL_NODE_IP}"
 echo "  Master        : ${BENCH_MASTER_ADDR}:${BENCH_MASTER_PORT}"
-echo "  Transport     : NCCL NET=IB (RDMA only)"
+echo "  Transport     : NCCL NET=IB (verbs/RoCE)"
 echo "  HCA           : ${NCCL_IB_HCA}"
 echo "  GDR NIC       : ${BENCH_GDR_NIC}"
 echo "  GDR ODP       : ${BENCH_GDR_USE_ODP}"
-echo "  NCCL SL       : ${NCCL_IB_SL}"
-echo "  GDR SL        : ${BENCH_GDR_IB_SL}"
+echo "  NCCL TC       : ${NCCL_IB_TC} (DSCP=$((NCCL_IB_TC >> 2)))"
+echo "  GDR TC        : ${BENCH_GDR_IB_TC} (DSCP=$((BENCH_GDR_IB_TC >> 2)))"
 echo "  NCCL target   : ${BENCH_QOS_MIN_NCCL_RATIO} of solo BW"
 echo "  GID index     : ${NCCL_IB_GID_INDEX:-auto}"
 echo "  GPU           : device ${BENCH_GPU_ID}"

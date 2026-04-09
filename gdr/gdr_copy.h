@@ -122,8 +122,11 @@ public:
     /** Return the NIC device name (e.g. "mlx5_0"). */
     virtual const std::string& nic_name() const = 0;
 
-    /** Return the IB service level used by this channel. */
-    virtual uint8_t ib_sl() const = 0;
+    /** Return the RoCE traffic class used by this channel. */
+    virtual uint8_t traffic_class() const = 0;
+
+    /** Return true when the underlying verbs port is RoCE/Ethernet. */
+    virtual bool is_roce() const = 0;
 };
 
 // ── library entry point ───────────────────────────────────────────────────────
@@ -136,13 +139,13 @@ public:
      * @param nic_name RDMA device name reported by ibv_devinfo (e.g. "mlx5_0")
      * @param use_odp  enable On-Demand Paging (slower first-touch, no BAR1 pin)
      *                 set false (default) for lowest latency on H20
-     * @param ib_sl    IB Service Level to use when programming the RC QP path
+     * @param traffic_class RoCE traffic class to use when programming the RC QP path
      * @throws std::runtime_error if GPU or NIC cannot be opened, or if
      *         GPUDirect is not supported by the driver stack.
      */
     static std::shared_ptr<GDRCopyChannel>
     open(int gpu_id, const std::string& nic_name, bool use_odp = false,
-         uint8_t ib_sl = 0);
+         uint8_t traffic_class = 0);
 
     /**
      * probe — check whether RDMA path is available without opening a channel.

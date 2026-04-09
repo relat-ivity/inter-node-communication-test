@@ -118,7 +118,7 @@ static void connect_rc_qp(struct ibv_qp* qp,
                            const QPEndpoint& local,
                            const QPEndpoint& remote,
                            bool is_roce,
-                           uint8_t ib_sl)
+                           uint8_t traffic_class)
 {
     // RESET → INIT
     {
@@ -150,12 +150,13 @@ static void connect_rc_qp(struct ibv_qp* qp,
             a.ah_attr.grh.hop_limit = 64;
             ::memcpy(&a.ah_attr.grh.dgid, remote.gid, 16);
             a.ah_attr.grh.sgid_index = 0;
+            a.ah_attr.grh.traffic_class = traffic_class;
             a.ah_attr.dlid           = 0;
         } else {
             a.ah_attr.is_global  = 0;
             a.ah_attr.dlid       = remote.lid;
         }
-        a.ah_attr.sl             = ib_sl;
+        a.ah_attr.sl             = 0;
         a.ah_attr.src_path_bits  = 0;
         a.ah_attr.port_num       = IBV_PORT;
 
@@ -189,7 +190,7 @@ static void connect_rc_qp(struct ibv_qp* qp,
 // ─────────────────────────────────────────────────────────────────────────────
 class GDRCopyChannelImpl : public GDRCopyChannel {
 public:
-    GDRCopyChannelImpl(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t ib_sl);
+    GDRCopyChannelImpl(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t traffic_class);
     ~GDRCopyChannelImpl() override;
 
     int memcpy(void* dst, const void* src,
@@ -206,7 +207,8 @@ public:
     void            reset_stats()       override { stats_ = {}; }
     int             gpu_id()      const override { return gpu_id_; }
     const std::string& nic_name() const override { return nic_name_; }
-    uint8_t         ib_sl()       const override { return ib_sl_; }
+    uint8_t         traffic_class() const override { return traffic_class_; }
+    bool            is_roce()     const override { return is_roce_; }
 
 private:
     // RDMA resources
@@ -237,7 +239,7 @@ private:
 
     int      gpu_id_;
     std::string nic_name_;
-    uint8_t  ib_sl_ = 0;
+    uint8_t  traffic_class_ = 0;
     bool     gdr_ok_  = false;   // false → fallback to cudaMemcpy
     bool     is_roce_ = false;
     uint64_t submit_wr_id_ = 0;
@@ -279,9 +281,9 @@ private:
 GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
                                        const std::string& nic_name,
                                        bool use_odp,
-                                       uint8_t ib_sl)
+                                       uint8_t traffic_class)
     : mr_cache_(MR_CACHE_CAP), host_mr_cache_(MR_CACHE_CAP),
-      gpu_id_(gpu_id), nic_name_(nic_name), ib_sl_(ib_sl)
+      gpu_id_(gpu_id), nic_name_(nic_name), traffic_class_(traffic_class)
 {
     // ── 1. Set CUDA device ────────────────────────────────────────────────
     check_cuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
@@ -365,7 +367,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
 
     QPEndpoint ep = query_ep(qp_, ctx_);
     // Loopback: remote endpoint == local endpoint
-    connect_rc_qp(qp_, ep, ep, is_roce_, ib_sl_);
+    connect_rc_qp(qp_, ep, ep, is_roce_, traffic_class_);
 
     // ── 5. Init pinned host pool ──────────────────────────────────────────
     pool_ = std::make_unique<PinnedPool>(pd_);
@@ -775,14 +777,14 @@ static std::mutex g_lib_mtx;
 static std::map<GDRChannelKey, std::shared_ptr<GDRCopyChannel>> g_channels;
 
 std::shared_ptr<GDRCopyChannel>
-GDRCopyLib::open(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t ib_sl)
+GDRCopyLib::open(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t traffic_class)
 {
     std::lock_guard<std::mutex> lk(g_lib_mtx);
-    auto key = std::make_tuple(gpu_id, nic_name, use_odp, ib_sl);
+    auto key = std::make_tuple(gpu_id, nic_name, use_odp, traffic_class);
     auto it = g_channels.find(key);
     if (it != g_channels.end()) return it->second;
 
-    auto ch = std::make_shared<GDRCopyChannelImpl>(gpu_id, nic_name, use_odp, ib_sl);
+    auto ch = std::make_shared<GDRCopyChannelImpl>(gpu_id, nic_name, use_odp, traffic_class);
     g_channels[key] = ch;
     return ch;
 }
