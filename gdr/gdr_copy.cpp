@@ -58,6 +58,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <vector>
 
@@ -116,7 +117,8 @@ static QPEndpoint query_ep(struct ibv_qp* qp, struct ibv_context* ctx) {
 static void connect_rc_qp(struct ibv_qp* qp,
                            const QPEndpoint& local,
                            const QPEndpoint& remote,
-                           bool is_roce)
+                           bool is_roce,
+                           uint8_t ib_sl)
 {
     // RESET → INIT
     {
@@ -153,7 +155,7 @@ static void connect_rc_qp(struct ibv_qp* qp,
             a.ah_attr.is_global  = 0;
             a.ah_attr.dlid       = remote.lid;
         }
-        a.ah_attr.sl             = 0;
+        a.ah_attr.sl             = ib_sl;
         a.ah_attr.src_path_bits  = 0;
         a.ah_attr.port_num       = IBV_PORT;
 
@@ -187,7 +189,7 @@ static void connect_rc_qp(struct ibv_qp* qp,
 // ─────────────────────────────────────────────────────────────────────────────
 class GDRCopyChannelImpl : public GDRCopyChannel {
 public:
-    GDRCopyChannelImpl(int gpu_id, const std::string& nic_name, bool use_odp);
+    GDRCopyChannelImpl(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t ib_sl);
     ~GDRCopyChannelImpl() override;
 
     int memcpy(void* dst, const void* src,
@@ -204,6 +206,7 @@ public:
     void            reset_stats()       override { stats_ = {}; }
     int             gpu_id()      const override { return gpu_id_; }
     const std::string& nic_name() const override { return nic_name_; }
+    uint8_t         ib_sl()       const override { return ib_sl_; }
 
 private:
     // RDMA resources
@@ -234,6 +237,7 @@ private:
 
     int      gpu_id_;
     std::string nic_name_;
+    uint8_t  ib_sl_ = 0;
     bool     gdr_ok_  = false;   // false → fallback to cudaMemcpy
     bool     is_roce_ = false;
     uint64_t submit_wr_id_ = 0;
@@ -274,9 +278,10 @@ private:
 // ── constructor ───────────────────────────────────────────────────────────────
 GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
                                        const std::string& nic_name,
-                                       bool use_odp)
+                                       bool use_odp,
+                                       uint8_t ib_sl)
     : mr_cache_(MR_CACHE_CAP), host_mr_cache_(MR_CACHE_CAP),
-      gpu_id_(gpu_id), nic_name_(nic_name)
+      gpu_id_(gpu_id), nic_name_(nic_name), ib_sl_(ib_sl)
 {
     // ── 1. Set CUDA device ────────────────────────────────────────────────
     check_cuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
@@ -360,7 +365,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
 
     QPEndpoint ep = query_ep(qp_, ctx_);
     // Loopback: remote endpoint == local endpoint
-    connect_rc_qp(qp_, ep, ep, is_roce_);
+    connect_rc_qp(qp_, ep, ep, is_roce_, ib_sl_);
 
     // ── 5. Init pinned host pool ──────────────────────────────────────────
     pool_ = std::make_unique<PinnedPool>(pd_);
@@ -764,19 +769,20 @@ int GDRCopyChannelImpl::sync() {
 // ─────────────────────────────────────────────────────────────────────────────
 // GDRCopyLib factory
 // ─────────────────────────────────────────────────────────────────────────────
-static std::mutex                                              g_lib_mtx;
-static std::map<std::pair<int,std::string>,
-                std::shared_ptr<GDRCopyChannel>>              g_channels;
+using GDRChannelKey = std::tuple<int, std::string, bool, uint8_t>;
+
+static std::mutex g_lib_mtx;
+static std::map<GDRChannelKey, std::shared_ptr<GDRCopyChannel>> g_channels;
 
 std::shared_ptr<GDRCopyChannel>
-GDRCopyLib::open(int gpu_id, const std::string& nic_name, bool use_odp)
+GDRCopyLib::open(int gpu_id, const std::string& nic_name, bool use_odp, uint8_t ib_sl)
 {
     std::lock_guard<std::mutex> lk(g_lib_mtx);
-    auto key = std::make_pair(gpu_id, nic_name);
+    auto key = std::make_tuple(gpu_id, nic_name, use_odp, ib_sl);
     auto it = g_channels.find(key);
     if (it != g_channels.end()) return it->second;
 
-    auto ch = std::make_shared<GDRCopyChannelImpl>(gpu_id, nic_name, use_odp);
+    auto ch = std::make_shared<GDRCopyChannelImpl>(gpu_id, nic_name, use_odp, ib_sl);
     g_channels[key] = ch;
     return ch;
 }

@@ -43,6 +43,10 @@
 
 #include "gdr/gdr_copy.h"
 
+#ifndef GDR_BENCH_ENABLE_QOS
+#define GDR_BENCH_ENABLE_QOS 0
+#endif
+
 struct ControlPlane {
     int rank = -1;
     int nranks = -1;
@@ -94,6 +98,46 @@ static int env_int(const char *name, int def) {
 static const char *env_str(const char *name, const char *def = nullptr) {
     const char *v = getenv(name);
     return (v && v[0] != '\0') ? v : def;
+}
+
+static int env_int_strict(const char *name, int def)
+{
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0') return def;
+
+    char *end = nullptr;
+    errno = 0;
+    long parsed = strtol(v, &end, 10);
+    if (errno != 0 || !end || end == v || *end != '\0') {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "invalid integer for %s: '%s'", name, v);
+    }
+    return static_cast<int>(parsed);
+}
+
+static double env_double_strict(const char *name, double def)
+{
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0') return def;
+
+    char *end = nullptr;
+    errno = 0;
+    double parsed = strtod(v, &end);
+    if (errno != 0 || !end || end == v || *end != '\0') {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "invalid floating-point value for %s: '%s'", name, v);
+    }
+    return parsed;
+}
+
+static int env_ib_sl(const char *name, int def)
+{
+    int sl = env_int_strict(name, def);
+    if (sl < 0 || sl > 15) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "%s=%d out of range (expected 0..15)", name, sl);
+    }
+    return sl;
 }
 
 static bool env_bool(const char *name, bool def)
@@ -369,6 +413,19 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
     printf("  %-16s | BW=%+6.1f%% | avg-lat=%+6.1f%%", name, bw_delta, lat_delta);
     bool bad = (bw_delta < -5.0) || (lat_delta > 5.0);
     printf(" | %s\n", bad ? "<-- INTERFERENCE" : "OK");
+}
+
+static void print_qos_check(const char *label, const Stats &solo_nccl,
+                            const Stats &conc_nccl, double target_ratio)
+{
+    double retain_ratio = 0.0;
+    if (solo_nccl.bw_gb_s > 0.0) {
+        retain_ratio = conc_nccl.bw_gb_s / solo_nccl.bw_gb_s;
+    }
+    printf("    %-24s | solo=%8.2f GB/s | concurrent=%8.2f GB/s | retain=%6.2f%% | target=%6.2f%% | %s\n",
+           label, solo_nccl.bw_gb_s, conc_nccl.bw_gb_s,
+           retain_ratio * 100.0, target_ratio * 100.0,
+           retain_ratio >= target_ratio ? "PASS" : "FAIL");
 }
 
 static Measurement measure_p2p(float *send_buf, float *recv_buf,
@@ -662,6 +719,23 @@ int main(int argc, char **argv)
     int warmup = env_int("BENCH_WARMUP", 5);
     int gpu_id = env_int("BENCH_GPU_ID", 0);
     bool gdr_use_odp = env_bool("BENCH_GDR_USE_ODP", false);
+#if GDR_BENCH_ENABLE_QOS
+    int gdr_ib_sl = env_ib_sl("BENCH_GDR_IB_SL", 1);
+    int nccl_ib_sl = env_ib_sl("NCCL_IB_SL", 0);
+    double qos_min_nccl_ratio = env_double_strict("BENCH_QOS_MIN_NCCL_RATIO", 0.99);
+    if (qos_min_nccl_ratio <= 0.0 || qos_min_nccl_ratio > 1.0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_QOS_MIN_NCCL_RATIO=%.6f out of range (expected 0 < ratio <= 1)",
+               qos_min_nccl_ratio);
+    }
+    if (gdr_ib_sl == nccl_ib_sl) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_GDR_IB_SL=%d must differ from NCCL_IB_SL=%d for SL/VL QoS validation",
+               gdr_ib_sl, nccl_ib_sl);
+    }
+#else
+    int gdr_ib_sl = 0;
+#endif
 
     size_t mem_bytes = static_cast<size_t>(buf_gb * 1e9);
     size_t p2p_bytes = static_cast<size_t>(p2p_buf_gb * 1e9);
@@ -710,7 +784,8 @@ int main(int argc, char **argv)
         memset(h_buf, 1, mem_bytes);
 
         try {
-            gdr_channel = GDRCopyLib::open(gpu_id, gdr_nic_name, gdr_use_odp);
+            gdr_channel = GDRCopyLib::open(
+                gpu_id, gdr_nic_name, gdr_use_odp, static_cast<uint8_t>(gdr_ib_sl));
         } catch (const std::exception &ex) {
             fatalf("GDR", __FILE__, __LINE__,
                    "failed to open GDR channel on NIC %s: %s",
@@ -728,12 +803,21 @@ int main(int argc, char **argv)
     if (rank == 0) {
         printf("\n");
         printf("============================================================\n");
+#if GDR_BENCH_ENABLE_QOS
+        printf("  Cross-node GDR QoS H2D/D2H vs ncclSend/ncclRecv Benchmark\n");
+#else
         printf("  Cross-node GDR H2D/D2H vs ncclSend/ncclRecv Benchmark\n");
+#endif
         printf("============================================================\n");
         printf("  GPU          : %s  (device %d)\n", gpu_name, gpu_id);
         printf("  NCCL HCA     : %s\n", ib_hca);
         printf("  GDR NIC      : %s  (ODP=%s)\n",
                gdr_nic_name.c_str(), gdr_use_odp ? "on" : "off");
+#if GDR_BENCH_ENABLE_QOS
+        printf("  NCCL SL      : %d\n", nccl_ib_sl);
+        printf("  GDR SL       : %u\n", static_cast<unsigned>(gdr_channel->ib_sl()));
+        printf("  NCCL target  : %.2f%% of solo BW\n", qos_min_nccl_ratio * 100.0);
+#endif
         printf("  Ranks        : %d  (1 GPU per node)\n", nranks);
         printf("  Mem copy     : rank0 only, GPUDirect RDMA H2D / D2H\n");
         printf("  Master       : %s:%d\n", master_addr, master_port);
@@ -816,6 +900,9 @@ int main(int argc, char **argv)
         print_stats(cr_d2h.mem_stats);
         print_gdr_transport_stats("GDR D2H transport", cr_d2h.gdr_stats);
         print_stats(cr_d2h.rs_stats);
+#if GDR_BENCH_ENABLE_QOS
+        print_qos_check("D2H + ncclSend", solo_rs, cr_d2h.rs_stats, qos_min_nccl_ratio);
+#endif
         printf("\n");
     }
     control_barrier();
@@ -833,6 +920,9 @@ int main(int argc, char **argv)
         print_stats(cr_h2d.mem_stats);
         print_gdr_transport_stats("GDR H2D transport", cr_h2d.gdr_stats);
         print_stats(cr_h2d.rs_stats);
+#if GDR_BENCH_ENABLE_QOS
+        print_qos_check("H2D + ncclSend", solo_rs, cr_h2d.rs_stats, qos_min_nccl_ratio);
+#endif
         printf("\n");
     }
     control_barrier();
@@ -848,6 +938,12 @@ int main(int argc, char **argv)
         printf("  [GDR H2D + ncclSend concurrently vs solo]\n");
         print_delta("GDR H2D", solo_h2d, cr_h2d.mem_stats);
         print_delta("Send (vs H2D)", solo_rs, cr_h2d.rs_stats);
+#if GDR_BENCH_ENABLE_QOS
+        printf("\n");
+        printf("  [QoS Validation]\n");
+        print_qos_check("D2H + ncclSend", solo_rs, cr_d2h.rs_stats, qos_min_nccl_ratio);
+        print_qos_check("H2D + ncclSend", solo_rs, cr_h2d.rs_stats, qos_min_nccl_ratio);
+#endif
         printf("============================================================\n\n");
     }
 
