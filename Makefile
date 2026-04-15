@@ -37,13 +37,13 @@ $(CUDA_BENCH): cuda_bench.cu | $(BUILD_DIR)
 	    -o $@ $< \
 	    $(COMMON_LIBS) $(COMMON_RPATH)
 
-$(GDR_BENCH): gdr_bench.cu gdr/gdr_copy.cpp gdr/gdr_copy.h gdr/mr_cache.h gdr/pinned_pool.h | $(BUILD_DIR)
+$(GDR_BENCH): gdr_bench.cu gdr/gdr_copy.cpp gdr/gdr_copy.h gdr/mr_cache.h | $(BUILD_DIR)
 	$(NVCC) $(CUDA_ARCH) -O3 -std=c++17 \
 	    $(COMMON_INC) -Igdr \
 	    -o $@ gdr_bench.cu gdr/gdr_copy.cpp \
 	    $(COMMON_LIBS) -libverbs -lpthread $(COMMON_RPATH)
 
-$(GDR_QOS_BENCH): gdr_qos_bench.cu gdr_bench.cu gdr/gdr_copy.cpp gdr/gdr_copy.h gdr/mr_cache.h gdr/pinned_pool.h | $(BUILD_DIR)
+$(GDR_QOS_BENCH): gdr_qos_bench.cu gdr_bench.cu gdr/gdr_copy.cpp gdr/gdr_copy.h gdr/mr_cache.h | $(BUILD_DIR)
 	$(NVCC) $(CUDA_ARCH) -O3 -std=c++17 \
 	    $(COMMON_INC) -Igdr \
 	    -o $@ gdr_qos_bench.cu gdr/gdr_copy.cpp \
