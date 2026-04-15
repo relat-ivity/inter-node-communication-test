@@ -20,7 +20,7 @@
  *     └─ GDRCopyChannel  (one per GPU × NIC pair)
  *          ├─ RC QP pair (loopback, one for H2D one for D2H)
  *          ├─ MRCache    (LRU, avoids re-registering GPU memory)
- *          └─ PinnedPool (pre-pinned host bounce buffers)
+ *          └─ Host MR cache (direct host-buffer registrations)
  *
  * Usage
  * -----

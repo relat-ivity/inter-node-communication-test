@@ -33,8 +33,8 @@
  *      b. Poll CQ for completion
  *      c. Copy pinned host slot → user dst  (memcpy)
  *
- * 6. Chunking: large transfers are broken into POOL_SLOT_SIZE pieces so
- *    we never need more than one slot at a time.
+ * 6. Chunking: large transfers are broken into direct host/GPU MR segments
+ *    so each RDMA WR stays below the configured per-request chunk size.
  *
  * 7. Fallback: if GPU MR registration fails (nvidia-peermem absent),
  *    we transparently fall back to cudaMemcpy and track fallback_ops.
@@ -42,7 +42,6 @@
 
 #include "gdr_copy.h"
 #include "mr_cache.h"
-#include "pinned_pool.h"
 
 #include <infiniband/verbs.h>
 #include <cuda_runtime.h>
@@ -54,6 +53,7 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -69,6 +69,10 @@ static constexpr int    QP_MAX_WR_TARGET = 30000;
 static constexpr int    QP_MAX_RECV_WR_TARGET = 100;
 static constexpr int    MAX_POLL_US   = 5000;  // 5 ms poll timeout
 static constexpr int    IBV_PORT      = 1;
+static constexpr size_t DIRECT_MR_CHUNK_SIZE = 2ULL << 30; // 2 GiB per registered segment
+
+static_assert(DIRECT_MR_CHUNK_SIZE <= std::numeric_limits<uint32_t>::max(),
+              "RDMA chunk size must fit inside ibv_sge.length");
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 static inline double now_us() {
@@ -221,9 +225,6 @@ private:
     MRCache mr_cache_;
     MRCache host_mr_cache_;
 
-    // Pinned host buffer pool
-    std::unique_ptr<PinnedPool> pool_;
-
     // Async state
     struct AsyncOp {
         void*    dst;
@@ -369,10 +370,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     // Loopback: remote endpoint == local endpoint
     connect_rc_qp(qp_, ep, ep, is_roce_, traffic_class_);
 
-    // ── 5. Init pinned host pool ──────────────────────────────────────────
-    pool_ = std::make_unique<PinnedPool>(pd_);
-
-    // ── 6. Probe GPUDirect capability ────────────────────────────────────
+    // ── 5. Probe GPUDirect capability ────────────────────────────────────
     // Allocate a tiny GPU buffer and try to register it with ibv_reg_mr.
     // If it succeeds, nvidia-peermem is present and GDR is available.
     void* probe_gpu = nullptr;
@@ -403,8 +401,6 @@ GDRCopyChannelImpl::~GDRCopyChannelImpl() {
         if (op.done_event) cudaEventDestroy(op.done_event);
     }
     async_ops_.clear();
-
-    pool_.reset();   // dereg pinned MRs before destroying PD
 
     // Flush MR cache
     // (MRCache destructor does NOT call ibv_dereg_mr; we do it here so
@@ -538,19 +534,16 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
         return (ce == cudaSuccess) ? 0 : -1;
     }
 
-    // Get / register GPU MR
-    struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)dst_gpu, bytes);
-
-    // Always register/find host MR first (works for pinned and pageable memory).
-    struct ibv_mr* host_mr = get_host_mr((uint64_t)src_host, bytes);
-    if (!host_mr) return -1;
     const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
     uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
     size_t remaining = bytes;
-    size_t chunk_size = pool_->slot_size();
+    size_t chunk_size = DIRECT_MR_CHUNK_SIZE;
 
     while (remaining > 0) {
         size_t n = std::min(remaining, chunk_size);
+        struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)dst8, n);
+        struct ibv_mr* host_mr = get_host_mr((uint64_t)src8, n);
+        if (!gpu_mr || !host_mr) return -1;
         int rc = rdma_write((uint64_t)dst8, gpu_mr->rkey,
                             (uint64_t)src8, host_mr->lkey,
                             n);
@@ -573,18 +566,16 @@ int GDRCopyChannelImpl::do_d2h(void* dst_host, const void* src_gpu, size_t bytes
         return (ce == cudaSuccess) ? 0 : -1;
     }
 
-    struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)src_gpu, bytes);
-
-    // Always register/find host MR first (works for pinned and pageable memory).
-    struct ibv_mr* host_mr = get_host_mr((uint64_t)dst_host, bytes);
-    if (!host_mr) return -1;
     uint8_t* dst8       = reinterpret_cast<uint8_t*>(dst_host);
     const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_gpu);
     size_t remaining = bytes;
-    size_t chunk_size = pool_->slot_size();
+    size_t chunk_size = DIRECT_MR_CHUNK_SIZE;
 
     while (remaining > 0) {
         size_t n = std::min(remaining, chunk_size);
+        struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)src8, n);
+        struct ibv_mr* host_mr = get_host_mr((uint64_t)dst8, n);
+        if (!gpu_mr || !host_mr) return -1;
         int rc = rdma_read((uint64_t)dst8, host_mr->lkey,
                            (uint64_t)src8, gpu_mr->rkey,
                            n);
@@ -634,7 +625,7 @@ int GDRCopyChannelImpl::memcpy_async_tagged(void* dst, const void* src,
     bool is_rdma = gdr_ok_ && (kind == GDR_H2D || kind == GDR_D2H);
     int pending_wcs = 0;
     if (is_rdma) {
-        size_t chunk_size = pool_->slot_size();
+        size_t chunk_size = DIRECT_MR_CHUNK_SIZE;
         pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
         if (pending_wcs > wr_budget_)
             return -E2BIG;
