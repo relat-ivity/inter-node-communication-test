@@ -41,6 +41,8 @@ struct ControlPlane {
 
 static int g_rank_for_log = -1;
 static ControlPlane g_control;
+static constexpr size_t kBytesPerKiB = 1ULL << 10;
+static constexpr size_t kKiBPerGiB = 1ULL << 20;
 static constexpr size_t kBytesPerGiB = 1ULL << 30;
 
 [[noreturn]] static void fatalf(const char *scope, const char *file, int line,
@@ -72,9 +74,14 @@ static constexpr size_t kBytesPerGiB = 1ULL << 30;
         }                                                                      \
     } while (0)
 
-static double env_double(const char *name, double def) {
-    const char *v = getenv(name);
-    return v ? atof(v) : def;
+static double env_buffer_kb(const char *kb_name, const char *gb_name, double def_kb) {
+    const char *kb = getenv(kb_name);
+    if (kb && kb[0] != '\0') return atof(kb);
+
+    const char *gb = getenv(gb_name);
+    if (gb && gb[0] != '\0') return atof(gb) * static_cast<double>(kKiBPerGiB);
+
+    return def_kb;
 }
 
 static int env_int(const char *name, int def) {
@@ -234,26 +241,6 @@ static void control_barrier()
     }
 }
 
-struct CudaTimer {
-    cudaEvent_t start, stop;
-    CudaTimer() {
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-    }
-    ~CudaTimer() {
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-    }
-    void begin(cudaStream_t s) { CUDA_CHECK(cudaEventRecord(start, s)); }
-    void end(cudaStream_t s) { CUDA_CHECK(cudaEventRecord(stop, s)); }
-    float elapsed_ms() {
-        float ms = 0;
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        return ms;
-    }
-};
-
 struct Stats {
     std::string label;
     double bw_gib_s;
@@ -271,6 +258,19 @@ struct Measurement {
     std::vector<float> lats_ms;
     double total_ms = 0.0;
 };
+
+static Measurement make_batch_measurement(int iters, double total_ms)
+{
+    if (iters <= 0) {
+        fatalf("CONFIG", __FILE__, __LINE__, "BENCH_ITERS must be positive");
+    }
+
+    Measurement result;
+    result.total_ms = total_ms;
+    result.lats_ms.assign(static_cast<size_t>(iters),
+                          static_cast<float>(total_ms / iters));
+    return result;
+}
 
 static Stats compute_stats(const std::string &label,
                            std::vector<float> &lats_ms,
@@ -315,49 +315,41 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
 static Measurement measure_d2h(float *d_buf, float *h_buf, size_t n_bytes,
                                cudaStream_t stream, int iters, int warmup)
 {
-    CudaTimer timer;
     for (int i = 0; i < warmup; i++) {
         CUDA_CHECK(cudaMemcpyAsync(h_buf, d_buf, n_bytes,
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    Measurement result;
-    result.lats_ms.reserve(iters);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
-        timer.begin(stream);
         CUDA_CHECK(cudaMemcpyAsync(h_buf, d_buf, n_bytes,
                                    cudaMemcpyDeviceToHost, stream));
-        timer.end(stream);
-        result.lats_ms.push_back(timer.elapsed_ms());
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::steady_clock::now();
-    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    return result;
+    return make_batch_measurement(
+        iters, std::chrono::duration<double, std::milli>(end - start).count());
 }
 
 static Measurement measure_h2d(float *d_buf, float *h_buf, size_t n_bytes,
                                cudaStream_t stream, int iters, int warmup)
 {
-    CudaTimer timer;
     for (int i = 0; i < warmup; i++) {
         CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, n_bytes,
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    Measurement result;
-    result.lats_ms.reserve(iters);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
-        timer.begin(stream);
         CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, n_bytes,
                                    cudaMemcpyHostToDevice, stream));
-        timer.end(stream);
-        result.lats_ms.push_back(timer.elapsed_ms());
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::steady_clock::now();
-    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    return result;
+    return make_batch_measurement(
+        iters, std::chrono::duration<double, std::milli>(end - start).count());
 }
 
 static Measurement measure_p2p(float *send_buf, float *recv_buf,
@@ -368,33 +360,38 @@ static Measurement measure_p2p(float *send_buf, float *recv_buf,
     if (nranks != 2) {
         fatalf("CONFIG", __FILE__, __LINE__, "ncclSend/ncclRecv mode requires 2 ranks");
     }
+    if (iters <= 0) {
+        fatalf("CONFIG", __FILE__, __LINE__, "BENCH_ITERS must be positive");
+    }
     size_t send_count = p2p_bytes / sizeof(float);
-    CudaTimer timer;
 
-    for (int i = 0; i < warmup; i++) {
-        if (g_control.rank == 0) {
-            NCCL_CHECK(ncclSend(send_buf, send_count, ncclFloat, 1, comm, stream));
-        } else {
-            NCCL_CHECK(ncclRecv(recv_buf, send_count, ncclFloat, 0, comm, stream));
+    if (warmup > 0) {
+        NCCL_CHECK(ncclGroupStart());
+        for (int i = 0; i < warmup; i++) {
+            if (g_control.rank == 0) {
+                NCCL_CHECK(ncclSend(send_buf, send_count, ncclFloat, 1, comm, stream));
+            } else {
+                NCCL_CHECK(ncclRecv(recv_buf, send_count, ncclFloat, 0, comm, stream));
+            }
         }
+        NCCL_CHECK(ncclGroupEnd());
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    Measurement result;
-    result.lats_ms.reserve(iters);
+
     auto start = std::chrono::steady_clock::now();
+    NCCL_CHECK(ncclGroupStart());
     for (int i = 0; i < iters; i++) {
-        timer.begin(stream);
         if (g_control.rank == 0) {
             NCCL_CHECK(ncclSend(send_buf, send_count, ncclFloat, 1, comm, stream));
         } else {
             NCCL_CHECK(ncclRecv(recv_buf, send_count, ncclFloat, 0, comm, stream));
         }
-        timer.end(stream);
-        result.lats_ms.push_back(timer.elapsed_ms());
     }
+    NCCL_CHECK(ncclGroupEnd());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     auto end = std::chrono::steady_clock::now();
-    result.total_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    return result;
+    return make_batch_measurement(
+        iters, std::chrono::duration<double, std::milli>(end - start).count());
 }
 
 struct ConcurrentResult {
@@ -544,16 +541,21 @@ int main(int argc, char **argv)
     g_rank_for_log = rank;
     g_control = init_control_plane(rank, nranks, master_addr, master_port);
 
-    double buf_gb = env_double("BENCH_BUF_GB", 4.0);
-    double p2p_buf_gb = env_double("BENCH_P2P_BUF_GB",
-                                   env_double("BENCH_AG_BUF_GB",
-                                              env_double("BENCH_RS_BUF_GB", 2.0)));
+    double buf_kb = env_buffer_kb("BENCH_BUF_KB", "BENCH_BUF_GB", 4.0);
+    double p2p_buf_kb = env_buffer_kb(
+        "BENCH_P2P_BUF_KB", "BENCH_P2P_BUF_GB",
+        env_buffer_kb("BENCH_AG_BUF_KB", "BENCH_AG_BUF_GB",
+                      env_buffer_kb("BENCH_RS_BUF_KB", "BENCH_RS_BUF_GB", 4.0)));
+    if (buf_kb <= 0.0 || p2p_buf_kb <= 0.0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_BUF_KB and BENCH_P2P_BUF_KB must be positive");
+    }
     int iters = env_int("BENCH_ITERS", 20);
     int warmup = env_int("BENCH_WARMUP", 5);
     int gpu_id = env_int("BENCH_GPU_ID", 0);
 
-    size_t mem_bytes = static_cast<size_t>(buf_gb * static_cast<double>(kBytesPerGiB));
-    size_t p2p_bytes = static_cast<size_t>(p2p_buf_gb * static_cast<double>(kBytesPerGiB));
+    size_t mem_bytes = static_cast<size_t>(buf_kb * static_cast<double>(kBytesPerKiB));
+    size_t p2p_bytes = static_cast<size_t>(p2p_buf_kb * static_cast<double>(kBytesPerKiB));
     mem_bytes = (mem_bytes / sizeof(float)) * sizeof(float);
     p2p_bytes = (p2p_bytes / sizeof(float)) * sizeof(float);
 
@@ -608,8 +610,8 @@ int main(int argc, char **argv)
         printf("  Ranks        : %d  (1 GPU per node)\n", nranks);
         printf("  Mem copy     : rank0 only\n");
         printf("  Master       : %s:%d\n", master_addr, master_port);
-        printf("  Mem buf      : %.1f GiB  (H2D / D2H)\n", buf_gb);
-        printf("  P2P buf      : %.1f GiB  (node0 send -> node1 recv)\n", p2p_buf_gb);
+        printf("  Mem buf      : %.1f KiB  (H2D / D2H)\n", buf_kb);
+        printf("  P2P buf      : %.1f KiB  (node0 send -> node1 recv)\n", p2p_buf_kb);
         printf("  Iterations   : %d  (warmup=%d)\n", iters, warmup);
         printf("============================================================\n\n");
     }

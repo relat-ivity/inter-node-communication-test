@@ -44,13 +44,15 @@ export NODE0=<rank0_ip>
 export NODE1=<rank1_ip>
 export NCCL_IB_HCA=mlx5_4
 export BENCH_GPU_ID=4
-export BENCH_BUF_GB=4
-export BENCH_P2P_BUF_GB=2
+export BENCH_BUF_KB=4
+export BENCH_P2P_BUF_KB=4
 export BENCH_ITERS=20
 export BENCH_WARMUP=5
 ```
 
-`BENCH_BUF_GB` 和 `BENCH_P2P_BUF_GB` 保留原变量名，但程序内部按 GiB 解释：`1` 个变量单位 = `1ULL << 30` bytes。输出带宽也使用 `GiB/s`。
+`BENCH_BUF_KB` 和 `BENCH_P2P_BUF_KB` 按 KiB 解释：`1` 个变量单位 = `1ULL << 10` bytes。比如 `4` 表示 4 KiB，`$((1 << 20))` 表示 1 GiB。输出带宽仍然使用 `GiB/s`。旧的 `BENCH_BUF_GB` / `BENCH_P2P_BUF_GB` 仍可作为兼容 fallback 使用，但新配置建议统一写 KB。
+
+带宽统计使用批量异步模式：每个测量阶段先连续下发 `BENCH_ITERS` 次传输，再统一等待 stream / GDR completion 结束，最后用 `buffer_size * BENCH_ITERS / total_time` 计算带宽。输出里的 `avg/p99/std` 是整批耗时折算到单次传输的展示值，不再是每次传输单独同步得到的 latency。
 
 如果 RoCE 环境需要指定 GID index：
 
