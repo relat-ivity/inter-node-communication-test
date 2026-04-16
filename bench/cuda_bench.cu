@@ -41,6 +41,7 @@ struct ControlPlane {
 
 static int g_rank_for_log = -1;
 static ControlPlane g_control;
+static constexpr size_t kBytesPerGiB = 1ULL << 30;
 
 [[noreturn]] static void fatalf(const char *scope, const char *file, int line,
                                 const char *fmt, ...)
@@ -255,7 +256,7 @@ struct CudaTimer {
 
 struct Stats {
     std::string label;
-    double bw_gb_s;
+    double bw_gib_s;
     double avg_ms;
     double p99_ms;
     double std_ms;
@@ -288,22 +289,23 @@ static Stats compute_stats(const std::string &label,
     size_t p99_idx = static_cast<size_t>(0.99 * lats_ms.size());
     double p99 = lats_ms[p99_idx];
 
-    double total_gb = static_cast<double>(bytes_per_iter) * lats_ms.size() / 1e9;
+    double total_gib = static_cast<double>(bytes_per_iter) * lats_ms.size() /
+                       static_cast<double>(kBytesPerGiB);
     double total_s = total_ms / 1e3;
-    double bw = total_gb / total_s;
+    double bw = total_gib / total_s;
 
     return {label, bw, avg, p99, std};
 }
 
 static void print_stats(const Stats &s)
 {
-    printf("  %-28s | BW=%8.2f GB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
-           s.label.c_str(), s.bw_gb_s, s.avg_ms, s.p99_ms, s.std_ms);
+    printf("  %-28s | BW=%8.2f GiB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
+           s.label.c_str(), s.bw_gib_s, s.avg_ms, s.p99_ms, s.std_ms);
 }
 
 static void print_delta(const char *name, const Stats &solo, const Stats &conc)
 {
-    double bw_delta = (conc.bw_gb_s - solo.bw_gb_s) / solo.bw_gb_s * 100.0;
+    double bw_delta = (conc.bw_gib_s - solo.bw_gib_s) / solo.bw_gib_s * 100.0;
     double lat_delta = (conc.avg_ms - solo.avg_ms) / solo.avg_ms * 100.0;
     printf("  %-16s | BW=%+6.1f%% | avg-lat=%+6.1f%%", name, bw_delta, lat_delta);
     bool bad = (bw_delta < -5.0) || (lat_delta > 5.0);
@@ -550,8 +552,8 @@ int main(int argc, char **argv)
     int warmup = env_int("BENCH_WARMUP", 5);
     int gpu_id = env_int("BENCH_GPU_ID", 0);
 
-    size_t mem_bytes = static_cast<size_t>(buf_gb * 1e9);
-    size_t p2p_bytes = static_cast<size_t>(p2p_buf_gb * 1e9);
+    size_t mem_bytes = static_cast<size_t>(buf_gb * static_cast<double>(kBytesPerGiB));
+    size_t p2p_bytes = static_cast<size_t>(p2p_buf_gb * static_cast<double>(kBytesPerGiB));
     mem_bytes = (mem_bytes / sizeof(float)) * sizeof(float);
     p2p_bytes = (p2p_bytes / sizeof(float)) * sizeof(float);
 
@@ -606,8 +608,8 @@ int main(int argc, char **argv)
         printf("  Ranks        : %d  (1 GPU per node)\n", nranks);
         printf("  Mem copy     : rank0 only\n");
         printf("  Master       : %s:%d\n", master_addr, master_port);
-        printf("  Mem buf      : %.1f GB  (H2D / D2H)\n", buf_gb);
-        printf("  P2P buf      : %.1f GB  (node0 send -> node1 recv)\n", p2p_buf_gb);
+        printf("  Mem buf      : %.1f GiB  (H2D / D2H)\n", buf_gb);
+        printf("  P2P buf      : %.1f GiB  (node0 send -> node1 recv)\n", p2p_buf_gb);
         printf("  Iterations   : %d  (warmup=%d)\n", iters, warmup);
         printf("============================================================\n\n");
     }
