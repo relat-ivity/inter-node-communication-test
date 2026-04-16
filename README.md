@@ -52,7 +52,18 @@ export BENCH_WARMUP=5
 
 `BENCH_BUF_KB` 和 `BENCH_P2P_BUF_KB` 按 KiB 解释：`1` 个变量单位 = `1ULL << 10` bytes。比如 `4` 表示 4 KiB，`$((1 << 20))` 表示 1 GiB。输出带宽仍然使用 `GiB/s`。旧的 `BENCH_BUF_GB` / `BENCH_P2P_BUF_GB` 仍可作为兼容 fallback 使用，但新配置建议统一写 KB。
 
-带宽统计使用批量异步模式：每个测量阶段先连续下发 `BENCH_ITERS` 次传输，再统一等待 stream / GDR completion 结束，最后用 `buffer_size * BENCH_ITERS / total_time` 计算带宽。输出里的 `avg/p99/std` 是整批耗时折算到单次传输的展示值，不再是每次传输单独同步得到的 latency。
+带宽统计使用批量异步模式：每个测量阶段先连续下发指定迭代次数的传输，再统一等待 stream / GDR completion 结束，最后用 `buffer_size * iterations / total_time` 计算带宽。输出里的 `avg/p99/std` 是整批耗时折算到单次传输的展示值，不再是每次传输单独同步得到的 latency。
+
+`gdr_bench` 和 `gdr_qos_bench` 可以把 GDR 与 NCCL 的迭代次数拆开配置：
+
+```bash
+export BENCH_GDR_ITERS=10000
+export BENCH_GDR_WARMUP=1000
+export BENCH_NCCL_ITERS=2000
+export BENCH_NCCL_WARMUP=200
+```
+
+如果不设置这些变量，它们会回退到 `BENCH_ITERS` 和 `BENCH_WARMUP`。
 
 如果 RoCE 环境需要指定 GID index：
 

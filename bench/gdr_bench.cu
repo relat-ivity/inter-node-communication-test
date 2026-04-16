@@ -333,7 +333,7 @@ struct Stats {
     double bw_gib_s;
     double avg_ms;
     double p99_ms;
-    double std_ms;
+    double total_ms;
 };
 
 static Stats make_idle_stats(const std::string &label)
@@ -361,7 +361,6 @@ static Measurement make_batch_measurement(int iters, double total_ms)
 
 struct GDRMeasurement {
     Measurement timing;
-    GDRStats transport;
 };
 
 static Stats compute_stats(const std::string &label,
@@ -374,10 +373,6 @@ static Stats compute_stats(const std::string &label,
     for (float v : lats_ms) sum += v;
     double avg = sum / lats_ms.size();
 
-    double var = 0;
-    for (float v : lats_ms) var += (v - avg) * (v - avg);
-    double std = sqrt(var / lats_ms.size());
-
     size_t p99_idx = static_cast<size_t>(0.99 * lats_ms.size());
     double p99 = lats_ms[p99_idx];
 
@@ -386,31 +381,13 @@ static Stats compute_stats(const std::string &label,
     double total_s = total_ms / 1e3;
     double bw = total_gib / total_s;
 
-    return {label, bw, avg, p99, std};
+    return {label, bw, avg, p99, total_ms};
 }
 
 static void print_stats(const Stats &s)
 {
-    printf("  %-28s | BW=%8.2f GiB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
-           s.label.c_str(), s.bw_gib_s, s.avg_ms, s.p99_ms, s.std_ms);
-}
-
-static const char *gdr_path_name(const GDRStats &s)
-{
-    if (s.total_ops == 0) return "idle";
-    if (s.rdma_ops > 0 && s.fallback_ops == 0) return "RDMA";
-    if (s.rdma_ops == 0 && s.fallback_ops > 0) return "cudaMemcpy fallback";
-    return "mixed";
-}
-
-static void print_gdr_transport_stats(const char *label, const GDRStats &s)
-{
-    printf("    %-28s | path=%-17s | ops=%6llu | rdma=%6llu | fallback=%6llu | avg-op=%9.3f us\n",
-           label, gdr_path_name(s),
-           static_cast<unsigned long long>(s.total_ops),
-           static_cast<unsigned long long>(s.rdma_ops),
-           static_cast<unsigned long long>(s.fallback_ops),
-           s.avg_latency_us);
+    printf("  %-28s | BW=%8.2f GiB/s | avg=%8.3f ms | p99=%8.3f ms | total=%8.3f ms\n",
+           s.label.c_str(), s.bw_gib_s, s.avg_ms, s.p99_ms, s.total_ms);
 }
 
 static void print_delta(const char *name, const Stats &solo, const Stats &conc)
@@ -420,19 +397,6 @@ static void print_delta(const char *name, const Stats &solo, const Stats &conc)
     printf("  %-16s | BW=%+6.1f%% | avg-lat=%+6.1f%%", name, bw_delta, lat_delta);
     bool bad = (bw_delta < -5.0) || (lat_delta > 5.0);
     printf(" | %s\n", bad ? "<-- INTERFERENCE" : "OK");
-}
-
-static void print_qos_check(const char *label, const Stats &solo_nccl,
-                            const Stats &conc_nccl, double target_ratio)
-{
-    double retain_ratio = 0.0;
-    if (solo_nccl.bw_gib_s > 0.0) {
-        retain_ratio = conc_nccl.bw_gib_s / solo_nccl.bw_gib_s;
-    }
-    printf("    %-24s | solo=%8.2f GiB/s | concurrent=%8.2f GiB/s | retain=%6.2f%% | target=%6.2f%% | %s\n",
-           label, solo_nccl.bw_gib_s, conc_nccl.bw_gib_s,
-           retain_ratio * 100.0, target_ratio * 100.0,
-           retain_ratio >= target_ratio ? "PASS" : "FAIL");
 }
 
 static Measurement measure_p2p(float *send_buf, float *recv_buf,
@@ -560,15 +524,12 @@ static GDRMeasurement measure_gdr_copy(const std::shared_ptr<GDRCopyChannel> &ch
 {
     gdr_submit_batch_and_wait(channel, dst, src, n_bytes, kind, warmup);
 
-    channel->reset_stats();
-
     GDRMeasurement result;
     auto start = std::chrono::steady_clock::now();
     gdr_submit_batch_and_wait(channel, dst, src, n_bytes, kind, iters);
     auto end = std::chrono::steady_clock::now();
     result.timing = make_batch_measurement(
         iters, std::chrono::duration<double, std::milli>(end - start).count());
-    result.transport = channel->stats();
     return result;
 }
 
@@ -589,7 +550,6 @@ static GDRMeasurement measure_gdr_h2d(const std::shared_ptr<GDRCopyChannel> &cha
 struct ConcurrentResult {
     Stats mem_stats;
     Stats rs_stats;
-    GDRStats gdr_stats;
 };
 
 static ConcurrentResult bench_concurrent_gdr_d2h_rs(
@@ -597,7 +557,8 @@ static ConcurrentResult bench_concurrent_gdr_d2h_rs(
         float *d_buf, float *h_buf, size_t mem_bytes,
         float *send_buf, float *recv_buf, size_t p2p_bytes, int nranks,
         ncclComm_t comm, cudaStream_t stream_rs,
-        int gpu_id, int iters, int warmup)
+        int gpu_id, int gdr_iters, int gdr_warmup,
+        int nccl_iters, int nccl_warmup)
 {
     GDRMeasurement mem_measurement;
     Measurement rs_measurement;
@@ -614,7 +575,7 @@ static ConcurrentResult bench_concurrent_gdr_d2h_rs(
                 std::this_thread::yield();
             }
             mem_measurement = measure_gdr_d2h(channel, d_buf, h_buf, mem_bytes,
-                                              iters, warmup);
+                                              gdr_iters, gdr_warmup);
         });
     }
 
@@ -625,7 +586,8 @@ static ConcurrentResult bench_concurrent_gdr_d2h_rs(
             std::this_thread::yield();
         }
         rs_measurement = measure_p2p(
-            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs,
+            nccl_iters, nccl_warmup);
     });
 
     const int expected_ready = do_memcpy ? 2 : 1;
@@ -647,7 +609,6 @@ static ConcurrentResult bench_concurrent_gdr_d2h_rs(
             : make_idle_stats("GDR D2H (concurrent, rank1 idle)"),
         compute_stats("ncclSend (concurrent)", rs_measurement.lats_ms,
                       p2p_bytes, rs_measurement.total_ms),
-        do_memcpy ? mem_measurement.transport : GDRStats{},
     };
 }
 
@@ -656,7 +617,8 @@ static ConcurrentResult bench_concurrent_gdr_h2d_rs(
         float *d_buf, float *h_buf, size_t mem_bytes,
         float *send_buf, float *recv_buf, size_t p2p_bytes, int nranks,
         ncclComm_t comm, cudaStream_t stream_rs,
-        int gpu_id, int iters, int warmup)
+        int gpu_id, int gdr_iters, int gdr_warmup,
+        int nccl_iters, int nccl_warmup)
 {
     GDRMeasurement mem_measurement;
     Measurement rs_measurement;
@@ -673,7 +635,7 @@ static ConcurrentResult bench_concurrent_gdr_h2d_rs(
                 std::this_thread::yield();
             }
             mem_measurement = measure_gdr_h2d(channel, d_buf, h_buf, mem_bytes,
-                                              iters, warmup);
+                                              gdr_iters, gdr_warmup);
         });
     }
 
@@ -684,7 +646,8 @@ static ConcurrentResult bench_concurrent_gdr_h2d_rs(
             std::this_thread::yield();
         }
         rs_measurement = measure_p2p(
-            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs,
+            nccl_iters, nccl_warmup);
     });
 
     const int expected_ready = do_memcpy ? 2 : 1;
@@ -706,7 +669,6 @@ static ConcurrentResult bench_concurrent_gdr_h2d_rs(
             : make_idle_stats("GDR H2D (concurrent, rank1 idle)"),
         compute_stats("ncclSend (concurrent)", rs_measurement.lats_ms,
                       p2p_bytes, rs_measurement.total_ms),
-        do_memcpy ? mem_measurement.transport : GDRStats{},
     };
 }
 
@@ -744,8 +706,20 @@ int main(int argc, char **argv)
         fatalf("CONFIG", __FILE__, __LINE__,
                "BENCH_BUF_KB and BENCH_P2P_BUF_KB must be positive");
     }
-    int iters = env_int("BENCH_ITERS", 20);
-    int warmup = env_int("BENCH_WARMUP", 5);
+    int default_iters = env_int_strict("BENCH_ITERS", 20);
+    int default_warmup = env_int_strict("BENCH_WARMUP", 5);
+    int gdr_iters = env_int_strict("BENCH_GDR_ITERS", default_iters);
+    int gdr_warmup = env_int_strict("BENCH_GDR_WARMUP", default_warmup);
+    int nccl_iters = env_int_strict("BENCH_NCCL_ITERS", default_iters);
+    int nccl_warmup = env_int_strict("BENCH_NCCL_WARMUP", default_warmup);
+    if (gdr_iters <= 0 || nccl_iters <= 0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_GDR_ITERS and BENCH_NCCL_ITERS must be positive");
+    }
+    if (gdr_warmup < 0 || nccl_warmup < 0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_GDR_WARMUP and BENCH_NCCL_WARMUP must be non-negative");
+    }
     int gpu_id = env_int("BENCH_GPU_ID", 0);
     bool gdr_use_odp = env_bool("BENCH_GDR_USE_ODP", false);
 #if GDR_BENCH_ENABLE_QOS
@@ -861,7 +835,8 @@ int main(int argc, char **argv)
         printf("  Master       : %s:%d\n", master_addr, master_port);
         printf("  Mem buf      : %.1f KiB  (GDR H2D / D2H)\n", buf_kb);
         printf("  P2P buf      : %.1f KiB  (node0 send -> node1 recv)\n", p2p_buf_kb);
-        printf("  Iterations   : %d  (warmup=%d)\n", iters, warmup);
+        printf("  GDR iters    : %d  (warmup=%d)\n", gdr_iters, gdr_warmup);
+        printf("  NCCL iters   : %d  (warmup=%d)\n", nccl_iters, nccl_warmup);
         printf("============================================================\n\n");
     }
     control_barrier();
@@ -872,18 +847,16 @@ int main(int argc, char **argv)
     }
     control_barrier();
     Stats solo_d2h = make_idle_stats("GDR D2H (solo)");
-    GDRStats solo_d2h_gdr{};
     if (rank == 0) {
         GDRMeasurement solo_d2h_measurement =
-            measure_gdr_d2h(gdr_channel, d_mem_buf, h_buf, mem_bytes, iters, warmup);
+            measure_gdr_d2h(gdr_channel, d_mem_buf, h_buf, mem_bytes,
+                            gdr_iters, gdr_warmup);
         solo_d2h = compute_stats("GDR D2H (solo)",
                                  solo_d2h_measurement.timing.lats_ms,
                                  mem_bytes, solo_d2h_measurement.timing.total_ms);
-        solo_d2h_gdr = solo_d2h_measurement.transport;
     }
     if (rank == 0) {
         print_stats(solo_d2h);
-        print_gdr_transport_stats("GDR D2H transport", solo_d2h_gdr);
         printf("\n");
     }
     control_barrier();
@@ -894,18 +867,16 @@ int main(int argc, char **argv)
     }
     control_barrier();
     Stats solo_h2d = make_idle_stats("GDR H2D (solo)");
-    GDRStats solo_h2d_gdr{};
     if (rank == 0) {
         GDRMeasurement solo_h2d_measurement =
-            measure_gdr_h2d(gdr_channel, d_mem_buf, h_buf, mem_bytes, iters, warmup);
+            measure_gdr_h2d(gdr_channel, d_mem_buf, h_buf, mem_bytes,
+                            gdr_iters, gdr_warmup);
         solo_h2d = compute_stats("GDR H2D (solo)",
                                  solo_h2d_measurement.timing.lats_ms,
                                  mem_bytes, solo_h2d_measurement.timing.total_ms);
-        solo_h2d_gdr = solo_h2d_measurement.transport;
     }
     if (rank == 0) {
         print_stats(solo_h2d);
-        print_gdr_transport_stats("GDR H2D transport", solo_h2d_gdr);
         printf("\n");
     }
     control_barrier();
@@ -916,7 +887,8 @@ int main(int argc, char **argv)
     }
     control_barrier();
     Measurement solo_rs_measurement =
-        measure_p2p(d_p2p_send, d_p2p_recv, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+        measure_p2p(d_p2p_send, d_p2p_recv, p2p_bytes, nranks, comm, stream_rs,
+                    nccl_iters, nccl_warmup);
     Stats solo_rs = compute_stats(
         "ncclSend (solo)", solo_rs_measurement.lats_ms, p2p_bytes, solo_rs_measurement.total_ms);
     if (rank == 0) {
@@ -933,14 +905,11 @@ int main(int argc, char **argv)
     ConcurrentResult cr_d2h = bench_concurrent_gdr_d2h_rs(
         gdr_channel, d_mem_buf, h_buf, mem_bytes,
         d_p2p_send, d_p2p_recv, p2p_bytes, nranks,
-        comm, stream_rs, gpu_id, iters, warmup);
+        comm, stream_rs, gpu_id, gdr_iters, gdr_warmup,
+        nccl_iters, nccl_warmup);
     if (rank == 0) {
         print_stats(cr_d2h.mem_stats);
-        print_gdr_transport_stats("GDR D2H transport", cr_d2h.gdr_stats);
         print_stats(cr_d2h.rs_stats);
-#if GDR_BENCH_ENABLE_QOS
-        print_qos_check("D2H + ncclSend", solo_rs, cr_d2h.rs_stats, qos_min_nccl_ratio);
-#endif
         printf("\n");
     }
     control_barrier();
@@ -953,14 +922,11 @@ int main(int argc, char **argv)
     ConcurrentResult cr_h2d = bench_concurrent_gdr_h2d_rs(
         gdr_channel, d_mem_buf, h_buf, mem_bytes,
         d_p2p_send, d_p2p_recv, p2p_bytes, nranks,
-        comm, stream_rs, gpu_id, iters, warmup);
+        comm, stream_rs, gpu_id, gdr_iters, gdr_warmup,
+        nccl_iters, nccl_warmup);
     if (rank == 0) {
         print_stats(cr_h2d.mem_stats);
-        print_gdr_transport_stats("GDR H2D transport", cr_h2d.gdr_stats);
         print_stats(cr_h2d.rs_stats);
-#if GDR_BENCH_ENABLE_QOS
-        print_qos_check("H2D + ncclSend", solo_rs, cr_h2d.rs_stats, qos_min_nccl_ratio);
-#endif
         printf("\n");
     }
     control_barrier();
@@ -976,12 +942,6 @@ int main(int argc, char **argv)
         printf("  [GDR H2D + ncclSend concurrently vs solo]\n");
         print_delta("GDR H2D", solo_h2d, cr_h2d.mem_stats);
         print_delta("Send (vs H2D)", solo_rs, cr_h2d.rs_stats);
-#if GDR_BENCH_ENABLE_QOS
-        printf("\n");
-        printf("  [QoS Validation]\n");
-        print_qos_check("D2H + ncclSend", solo_rs, cr_d2h.rs_stats, qos_min_nccl_ratio);
-        print_qos_check("H2D + ncclSend", solo_rs, cr_h2d.rs_stats, qos_min_nccl_ratio);
-#endif
         printf("============================================================\n\n");
     }
 

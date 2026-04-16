@@ -246,7 +246,7 @@ struct Stats {
     double bw_gib_s;
     double avg_ms;
     double p99_ms;
-    double std_ms;
+    double total_ms;
 };
 
 static Stats make_idle_stats(const std::string &label)
@@ -282,10 +282,6 @@ static Stats compute_stats(const std::string &label,
     for (float v : lats_ms) sum += v;
     double avg = sum / lats_ms.size();
 
-    double var = 0;
-    for (float v : lats_ms) var += (v - avg) * (v - avg);
-    double std = sqrt(var / lats_ms.size());
-
     size_t p99_idx = static_cast<size_t>(0.99 * lats_ms.size());
     double p99 = lats_ms[p99_idx];
 
@@ -294,13 +290,13 @@ static Stats compute_stats(const std::string &label,
     double total_s = total_ms / 1e3;
     double bw = total_gib / total_s;
 
-    return {label, bw, avg, p99, std};
+    return {label, bw, avg, p99, total_ms};
 }
 
 static void print_stats(const Stats &s)
 {
-    printf("  %-28s | BW=%8.2f GiB/s | avg=%8.3f ms | p99=%8.3f ms | std=%7.3f ms\n",
-           s.label.c_str(), s.bw_gib_s, s.avg_ms, s.p99_ms, s.std_ms);
+    printf("  %-28s | BW=%8.2f GiB/s | avg=%8.3f ms | p99=%8.3f ms | total=%8.3f ms\n",
+           s.label.c_str(), s.bw_gib_s, s.avg_ms, s.p99_ms, s.total_ms);
 }
 
 static void print_delta(const char *name, const Stats &solo, const Stats &conc)
