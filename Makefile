@@ -20,11 +20,13 @@ COMMON_RPATH := -Xlinker -rpath -Xlinker $(CUDA_HOME)/lib64 \
 CUDA_BENCH := $(BUILD_DIR)/cuda_bench
 GDR_BENCH := $(BUILD_DIR)/gdr_bench
 GDR_QOS_BENCH := $(BUILD_DIR)/gdr_qos_bench
-TARGETS := $(CUDA_BENCH) $(GDR_BENCH) $(GDR_QOS_BENCH)
+NCCL_LATENCY_BENCH := $(BUILD_DIR)/nccl_latency_bench
+TARGETS := $(CUDA_BENCH) $(GDR_BENCH) $(GDR_QOS_BENCH) $(NCCL_LATENCY_BENCH)
 
 CUDA_BENCH_SRC := $(BENCH_SRC_DIR)/cuda_bench.cu
 GDR_BENCH_SRC := $(BENCH_SRC_DIR)/gdr_bench.cu
 GDR_QOS_BENCH_SRC := $(BENCH_SRC_DIR)/gdr_qos_bench.cu
+NCCL_LATENCY_BENCH_SRC := $(BENCH_SRC_DIR)/nccl_latency_bench.cu
 
 all: $(TARGETS)
 
@@ -36,6 +38,8 @@ cuda_bench: $(CUDA_BENCH)
 gdr_bench: $(GDR_BENCH)
 
 gdr_qos_bench: $(GDR_QOS_BENCH)
+
+nccl_latency_bench: $(NCCL_LATENCY_BENCH)
 
 $(CUDA_BENCH): $(CUDA_BENCH_SRC) | $(BUILD_DIR)
 	$(NVCC) $(CUDA_ARCH) -O3 -std=c++17 \
@@ -55,7 +59,13 @@ $(GDR_QOS_BENCH): $(GDR_QOS_BENCH_SRC) $(GDR_BENCH_SRC) gdr/gdr_copy.cpp gdr/gdr
 	    -o $@ $(GDR_QOS_BENCH_SRC) gdr/gdr_copy.cpp \
 	    $(COMMON_LIBS) -libverbs -lpthread $(COMMON_RPATH)
 
-clean:
-	rm -rf $(BUILD_DIR) cuda_bench gdr_bench gdr_qos_bench
+$(NCCL_LATENCY_BENCH): $(NCCL_LATENCY_BENCH_SRC) | $(BUILD_DIR)
+	$(NVCC) $(CUDA_ARCH) -O3 -std=c++17 \
+	    $(COMMON_INC) \
+	    -o $@ $< \
+	    $(COMMON_LIBS) $(COMMON_RPATH)
 
-.PHONY: all clean cuda_bench gdr_bench gdr_qos_bench
+clean:
+	rm -rf $(BUILD_DIR) cuda_bench gdr_bench gdr_qos_bench nccl_latency_bench
+
+.PHONY: all clean cuda_bench gdr_bench gdr_qos_bench nccl_latency_bench

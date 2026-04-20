@@ -9,6 +9,9 @@
 # To run the GDR benchmark:
 #   BENCH_BIN=gdr_bench bash run.sh rank0
 #   BENCH_BIN=gdr_bench bash run.sh rank1
+# To run the NCCL issue-latency/bandwidth sweep:
+#   BENCH_BIN=nccl_latency_bench bash run.sh rank0
+#   BENCH_BIN=nccl_latency_bench bash run.sh rank1
 
 DEFAULT_NODE0=
 DEFAULT_NODE1=
@@ -40,10 +43,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 BENCH_BIN=${BENCH_BIN:-$DEFAULT_BENCH_BIN}
 case "$BENCH_BIN" in
-    cuda_bench|gdr_bench)
+    cuda_bench|gdr_bench|nccl_latency_bench)
         ;;
     *)
-        echo "ERROR: BENCH_BIN must be cuda_bench or gdr_bench."
+        echo "ERROR: BENCH_BIN must be cuda_bench, gdr_bench, or nccl_latency_bench."
         exit 1
         ;;
 esac
