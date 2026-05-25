@@ -9,6 +9,9 @@
 # To run the GDR benchmark:
 #   BENCH_BIN=gdr_bench bash run.sh rank0
 #   BENCH_BIN=gdr_bench bash run.sh rank1
+# To run the CUDA memcpy + NCCL send concurrent bandwidth benchmark:
+#   BENCH_BIN=cuda_nccl_bench bash run.sh rank0
+#   BENCH_BIN=cuda_nccl_bench bash run.sh rank1
 # To run the NCCL issue-latency/bandwidth sweep:
 #   BENCH_BIN=nccl_latency_bench bash run.sh rank0
 #   BENCH_BIN=nccl_latency_bench bash run.sh rank1
@@ -20,6 +23,8 @@ DEFAULT_NCCL_IB_HCA=mlx5_0
 DEFAULT_BENCH_GPU_ID=0
 DEFAULT_BENCH_BUF_KB=4
 DEFAULT_BENCH_P2P_BUF_KB=4
+DEFAULT_BENCH_CUDA_ITERS=100
+DEFAULT_BENCH_CUDA_WARMUP=10
 DEFAULT_BENCH_GDR_ITERS=100
 DEFAULT_BENCH_GDR_WARMUP=10
 DEFAULT_BENCH_NCCL_ITERS=100
@@ -43,10 +48,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 BENCH_BIN=${BENCH_BIN:-$DEFAULT_BENCH_BIN}
 case "$BENCH_BIN" in
-    cuda_bench|gdr_bench|nccl_latency_bench)
+    cuda_bench|cuda_nccl_bench|gdr_bench|nccl_latency_bench)
         ;;
     *)
-        echo "ERROR: BENCH_BIN must be cuda_bench, gdr_bench, or nccl_latency_bench."
+        echo "ERROR: BENCH_BIN must be cuda_bench, cuda_nccl_bench, gdr_bench, or nccl_latency_bench."
         exit 1
         ;;
 esac
@@ -76,6 +81,8 @@ elif [[ -n "${BENCH_P2P_BUF_GB:-}" || -n "${BENCH_AG_BUF_GB:-}" || -n "${BENCH_R
 else
     export BENCH_P2P_BUF_KB=$DEFAULT_BENCH_P2P_BUF_KB
 fi
+export BENCH_CUDA_ITERS=${BENCH_CUDA_ITERS:-${BENCH_GDR_ITERS:-$DEFAULT_BENCH_CUDA_ITERS}}
+export BENCH_CUDA_WARMUP=${BENCH_CUDA_WARMUP:-${BENCH_GDR_WARMUP:-$DEFAULT_BENCH_CUDA_WARMUP}}
 export BENCH_GDR_ITERS=${BENCH_GDR_ITERS:-$DEFAULT_BENCH_GDR_ITERS}
 export BENCH_GDR_WARMUP=${BENCH_GDR_WARMUP:-$DEFAULT_BENCH_GDR_WARMUP}
 export BENCH_NCCL_ITERS=${BENCH_NCCL_ITERS:-$DEFAULT_BENCH_NCCL_ITERS}
@@ -147,6 +154,10 @@ if [[ "$BENCH_BIN" == "gdr_bench" ]]; then
     echo "  GDR NIC   : ${BENCH_GDR_NIC}"
     echo "  GDR ODP   : ${BENCH_GDR_USE_ODP}"
 fi
+if [[ "$BENCH_BIN" == "cuda_bench" || "$BENCH_BIN" == "cuda_nccl_bench" ]]; then
+    echo "  CUDA iters: ${BENCH_CUDA_ITERS} (warmup=${BENCH_CUDA_WARMUP})"
+fi
+echo "  NCCL iters: ${BENCH_NCCL_ITERS} (warmup=${BENCH_NCCL_WARMUP})"
 echo "  GID index : ${NCCL_IB_GID_INDEX:-auto}"
 echo "  GPU       : device ${BENCH_GPU_ID}"
 echo "========================================================"

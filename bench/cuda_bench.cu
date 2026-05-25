@@ -89,6 +89,19 @@ static int env_int(const char *name, int def) {
     return v ? atoi(v) : def;
 }
 
+static int env_int_strict(const char *name, int def)
+{
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0') return def;
+    char *end = nullptr;
+    long parsed = strtol(v, &end, 10);
+    if (end == v || *end != '\0') {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "%s must be an integer, got '%s'", name, v);
+    }
+    return static_cast<int>(parsed);
+}
+
 static const char *env_str(const char *name, const char *def = nullptr) {
     const char *v = getenv(name);
     return (v && v[0] != '\0') ? v : def;
@@ -400,7 +413,8 @@ static ConcurrentResult bench_concurrent_d2h_rs(
         float *send_buf, float *recv_buf, size_t p2p_bytes, int nranks,
         ncclComm_t comm,
         cudaStream_t stream_mem, cudaStream_t stream_rs,
-        int gpu_id, int iters, int warmup,
+        int gpu_id, int cuda_iters, int cuda_warmup,
+        int nccl_iters, int nccl_warmup,
         const char *mem_label)
 {
     Measurement mem_measurement;
@@ -418,7 +432,7 @@ static ConcurrentResult bench_concurrent_d2h_rs(
                 std::this_thread::yield();
             }
             mem_measurement = measure_d2h(
-                d_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+                d_buf, h_buf, mem_bytes, stream_mem, cuda_iters, cuda_warmup);
         });
     }
 
@@ -429,7 +443,8 @@ static ConcurrentResult bench_concurrent_d2h_rs(
             std::this_thread::yield();
         }
         rs_measurement = measure_p2p(
-            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs,
+            nccl_iters, nccl_warmup);
     });
 
     const int expected_ready = do_memcpy ? 2 : 1;
@@ -459,7 +474,8 @@ static ConcurrentResult bench_concurrent_h2d_rs(
         float *send_buf, float *recv_buf, size_t p2p_bytes, int nranks,
         ncclComm_t comm,
         cudaStream_t stream_mem, cudaStream_t stream_rs,
-        int gpu_id, int iters, int warmup)
+        int gpu_id, int cuda_iters, int cuda_warmup,
+        int nccl_iters, int nccl_warmup)
 {
     Measurement mem_measurement;
     Measurement rs_measurement;
@@ -476,7 +492,7 @@ static ConcurrentResult bench_concurrent_h2d_rs(
                 std::this_thread::yield();
             }
             mem_measurement = measure_h2d(
-                d_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+                d_buf, h_buf, mem_bytes, stream_mem, cuda_iters, cuda_warmup);
         });
     }
 
@@ -487,7 +503,8 @@ static ConcurrentResult bench_concurrent_h2d_rs(
             std::this_thread::yield();
         }
         rs_measurement = measure_p2p(
-            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+            send_buf, recv_buf, p2p_bytes, nranks, comm, stream_rs,
+            nccl_iters, nccl_warmup);
     });
 
     const int expected_ready = do_memcpy ? 2 : 1;
@@ -546,8 +563,20 @@ int main(int argc, char **argv)
         fatalf("CONFIG", __FILE__, __LINE__,
                "BENCH_BUF_KB and BENCH_P2P_BUF_KB must be positive");
     }
-    int iters = env_int("BENCH_ITERS", 20);
-    int warmup = env_int("BENCH_WARMUP", 5);
+    int default_iters = env_int_strict("BENCH_ITERS", 20);
+    int default_warmup = env_int_strict("BENCH_WARMUP", 5);
+    int cuda_iters = env_int_strict("BENCH_CUDA_ITERS", default_iters);
+    int cuda_warmup = env_int_strict("BENCH_CUDA_WARMUP", default_warmup);
+    int nccl_iters = env_int_strict("BENCH_NCCL_ITERS", default_iters);
+    int nccl_warmup = env_int_strict("BENCH_NCCL_WARMUP", default_warmup);
+    if (cuda_iters <= 0 || nccl_iters <= 0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_CUDA_ITERS and BENCH_NCCL_ITERS must be positive");
+    }
+    if (cuda_warmup < 0 || nccl_warmup < 0) {
+        fatalf("CONFIG", __FILE__, __LINE__,
+               "BENCH_CUDA_WARMUP and BENCH_NCCL_WARMUP must be non-negative");
+    }
     int gpu_id = env_int("BENCH_GPU_ID", 0);
 
     size_t mem_bytes = static_cast<size_t>(buf_kb * static_cast<double>(kBytesPerKiB));
@@ -608,7 +637,8 @@ int main(int argc, char **argv)
         printf("  Master       : %s:%d\n", master_addr, master_port);
         printf("  Mem buf      : %.1f KiB  (H2D / D2H)\n", buf_kb);
         printf("  P2P buf      : %.1f KiB  (node0 send -> node1 recv)\n", p2p_buf_kb);
-        printf("  Iterations   : %d  (warmup=%d)\n", iters, warmup);
+        printf("  CUDA iters   : %d  (warmup=%d)\n", cuda_iters, cuda_warmup);
+        printf("  NCCL iters   : %d  (warmup=%d)\n", nccl_iters, nccl_warmup);
         printf("============================================================\n\n");
     }
     control_barrier();
@@ -621,7 +651,8 @@ int main(int argc, char **argv)
     Stats solo_d2h = make_idle_stats("D2H (solo)");
     if (rank == 0) {
         Measurement solo_d2h_measurement =
-            measure_d2h(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+            measure_d2h(d_mem_buf, h_buf, mem_bytes, stream_mem,
+                        cuda_iters, cuda_warmup);
         solo_d2h = compute_stats(
             "D2H (solo)", solo_d2h_measurement.lats_ms, mem_bytes, solo_d2h_measurement.total_ms);
     }
@@ -636,7 +667,8 @@ int main(int argc, char **argv)
     Stats solo_h2d = make_idle_stats("H2D (solo)");
     if (rank == 0) {
         Measurement solo_h2d_measurement =
-            measure_h2d(d_mem_buf, h_buf, mem_bytes, stream_mem, iters, warmup);
+            measure_h2d(d_mem_buf, h_buf, mem_bytes, stream_mem,
+                        cuda_iters, cuda_warmup);
         solo_h2d = compute_stats(
             "H2D (solo)", solo_h2d_measurement.lats_ms, mem_bytes, solo_h2d_measurement.total_ms);
     }
@@ -649,7 +681,8 @@ int main(int argc, char **argv)
     }
     control_barrier();
     Measurement solo_rs_measurement =
-        measure_p2p(d_p2p_send, d_p2p_recv, p2p_bytes, nranks, comm, stream_rs, iters, warmup);
+        measure_p2p(d_p2p_send, d_p2p_recv, p2p_bytes, nranks, comm, stream_rs,
+                    nccl_iters, nccl_warmup);
     Stats solo_rs = compute_stats(
         "ncclSend (solo)", solo_rs_measurement.lats_ms, p2p_bytes, solo_rs_measurement.total_ms);
     if (rank == 0) { print_stats(solo_rs); printf("\n"); }
@@ -662,7 +695,8 @@ int main(int argc, char **argv)
     control_barrier();
     ConcurrentResult cr_d2h = bench_concurrent_d2h_rs(
         d_mem_buf, h_buf, mem_bytes, d_p2p_send, d_p2p_recv, p2p_bytes, nranks,
-        comm, stream_mem, stream_rs, gpu_id, iters, warmup, "D2H");
+        comm, stream_mem, stream_rs, gpu_id, cuda_iters, cuda_warmup,
+        nccl_iters, nccl_warmup, "D2H");
     if (rank == 0) {
         print_stats(cr_d2h.mem_stats);
         print_stats(cr_d2h.rs_stats);
@@ -677,7 +711,8 @@ int main(int argc, char **argv)
     control_barrier();
     ConcurrentResult cr_h2d = bench_concurrent_h2d_rs(
         d_mem_buf, h_buf, mem_bytes, d_p2p_send, d_p2p_recv, p2p_bytes, nranks,
-        comm, stream_mem, stream_rs, gpu_id, iters, warmup);
+        comm, stream_mem, stream_rs, gpu_id, cuda_iters, cuda_warmup,
+        nccl_iters, nccl_warmup);
     if (rank == 0) {
         print_stats(cr_h2d.mem_stats);
         print_stats(cr_h2d.rs_stats);
